@@ -1,0 +1,72 @@
+# ==========================
+# Vagrant
+# ==========================
+
+# Vagrant运行状态
+.vagrant/
+
+# Vagrant box镜像
+*.box
+
+
+# ==========================
+# 编译产物
+# ==========================
+
+# object文件
+*.o
+
+# 可执行文件
+client
+server
+
+# build目录中的生成文件
+tju_tcp/build/
+
+
+# ==========================
+# Test编译生成文件
+# ==========================
+
+# test目录下的二进制程序
+tju_tcp/test/receiver
+tju_tcp/test/sender
+tju_tcp/test/test
+tju_tcp/test/test_congestion
+tju_tcp/test/close_server
+tju_tcp/test/gen_graph_seq
+tju_tcp/test/gen_graph_win
+
+
+# ==========================
+# IDE / 编辑器
+# ==========================
+
+.vscode/
+.idea/
+
+# VS Code工作区文件
+*.code-workspace
+
+
+# ==========================
+# AI / 工具配置
+# ==========================
+
+.mcp.json
+
+
+# ==========================
+# 临时文件
+# ==========================
+
+*.log
+*.tmp
+*.swp
+
+
+# ==========================
+# 文档资料（课程文件）
+# ==========================
+
+*.pdf

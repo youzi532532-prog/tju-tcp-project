@@ -98,6 +98,9 @@ typedef struct {
 typedef struct {
 	int state; // TCP的状态
 
+	uint32_t seq_num;
+	uint32_t ack_num;/*序号和确认号*/
+
 	tju_sock_addr bind_addr; // 存放bind和listen时该socket绑定的IP和端口
 	tju_sock_addr established_local_addr; // 存放建立连接后 本机的 IP和端口
 	tju_sock_addr established_remote_addr; // 存放建立连接后 连接对方的 IP和端口

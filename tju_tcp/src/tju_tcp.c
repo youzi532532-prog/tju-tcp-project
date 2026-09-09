@@ -127,6 +127,23 @@ int tju_connect(tju_tcp_t* sock, tju_sock_addr target_addr){
         0
     );/*构造SYN包*/
     sendToLayer3(msg, DEFAULT_HEADER_LEN);/*发送SYN包*/
+    sock->seq_num++;
+
+    /*
+     * 等待三次握手完成
+     */
+    pthread_mutex_lock(&(sock->recv_lock));
+
+    while(sock->state != ESTABLISHED){
+
+        pthread_cond_wait(
+            &(sock->wait_cond),
+            &(sock->recv_lock)
+        );
+    }
+
+
+    pthread_mutex_unlock(&(sock->recv_lock));
 
     // 将建立了连接的socket放入内核 已建立连接哈希表中
     // int hashval = cal_hash(local_addr.ip, local_addr.port, target_addr.ip, target_addr.port);
@@ -184,76 +201,56 @@ int tju_recv(tju_tcp_t* sock, void *buffer, int len){
     return 0;
 }
 
-
 int tju_handle_packet(tju_tcp_t* sock, char* pkt){
 
     uint8_t flags = get_flags(pkt);
-
-
     /*
      * 情况1：
-     * server监听状态收到SYN
+     * server LISTEN状态收到SYN
      *
-     * LISTEN
-     *      |
-     *      SYN
-     *      |
-     *      v
-     * SYN_RECV
+     * client              server
      *
-     * 回复 SYN+ACK
+     * SYN  ------------>
+     *
+     *                 SYN_RECV
+     *
+     * SYN+ACK <------------
+     *
      */
     if(sock->state == LISTEN &&
        (flags & SYN_FLAG_MASK)){
-
         printf("server received SYN\n");
-
-
         tju_tcp_t* new_conn = tju_socket();
-
-
-        // 状态转换
-        new_conn->state = SYN_RECV;
-
-
         /*
-         * 保存连接双方地址
+         * 状态转换
          */
-
+        new_conn->state = SYN_RECV;
+        /*
+         * 保存四元组
+         */
         // server地址
         new_conn->established_local_addr.ip =
             sock->bind_addr.ip;
-
         new_conn->established_local_addr.port =
             get_dst(pkt);
-
-
         // client地址
         new_conn->established_remote_addr.ip =
             inet_network(CLIENT_IP);
-
         new_conn->established_remote_addr.port =
             get_src(pkt);
-
-
-
         /*
          * 序号处理
          */
-
-        // 对方SYN消耗一个序号
-        new_conn->ack_num = get_seq(pkt) + 1;
-
-
-        // server自己的初始序号
+        // client SYN占用一个序号
+        new_conn->ack_num =
+            get_seq(pkt)+1;
+        // server初始序号
         new_conn->seq_num = 100;
-
-
-
         /*
-         * 暂时加入established表
+         * 保存到连接表
          *
          * 课程框架没有半连接队列
+         * 暂时直接保存
          */
         int hashval = cal_hash(
             new_conn->established_local_addr.ip,
@@ -261,45 +258,33 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
             new_conn->established_remote_addr.ip,
             new_conn->established_remote_addr.port
         );
-
         established_socks[hashval] = new_conn;
-
-
-
         /*
          * 构造SYN+ACK
          */
-
         char* synack = create_packet_buf(
             new_conn->established_local_addr.port,
             new_conn->established_remote_addr.port,
-
             new_conn->seq_num,
             new_conn->ack_num,
-
             DEFAULT_HEADER_LEN,
             DEFAULT_HEADER_LEN,
-
             SYN_FLAG_MASK | ACK_FLAG_MASK,
-
             1,
             0,
-
             NULL,
             0
         );
-
-
         sendToLayer3(
             synack,
             DEFAULT_HEADER_LEN
         );
-
-
+        /*
+         * SYN消耗一个序号
+         */
+        new_conn->seq_num++;
         return 0;
     }
-
-
 
     /*
      * 情况2：
@@ -307,71 +292,52 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
      *
      * SYN_SENT
      *
-     *      SYN+ACK
-     * <------------
+     *          SYN+ACK
+     * <----------------
      *
      * ESTABLISHED
      */
     if(sock->state == SYN_SENT &&
        (flags & SYN_FLAG_MASK) &&
        (flags & ACK_FLAG_MASK)){
-
-
         printf("client received SYN+ACK\n");
 
-
         pthread_mutex_lock(&(sock->recv_lock));
-
-
         /*
          * 更新确认号
+         *
+         * server SYN占一个序号
          */
-
-        sock->ack_num = get_seq(pkt) + 1;
-
-
-
+        sock->ack_num =
+            get_seq(pkt)+1;
         /*
          * 回复ACK
          */
-
         char* ack_pkt = create_packet_buf(
             sock->established_local_addr.port,
             sock->established_remote_addr.port,
-
-            sock->seq_num + 1,
+            sock->seq_num,
             sock->ack_num,
-
             DEFAULT_HEADER_LEN,
             DEFAULT_HEADER_LEN,
-
             ACK_FLAG_MASK,
-
             1,
             0,
-
             NULL,
             0
         );
-
-
         sendToLayer3(
             ack_pkt,
             DEFAULT_HEADER_LEN
         );
 
-
-
         /*
-         * 三次握手完成
+         * 进入ESTABLISHED
          */
 
         sock->state = ESTABLISHED;
-
-
-
         /*
-         * 加入已建立连接表
+         * 放入已建立连接表
          */
 
         int hashval = cal_hash(
@@ -380,12 +346,7 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
             sock->established_remote_addr.ip,
             sock->established_remote_addr.port
         );
-
-
         established_socks[hashval] = sock;
-
-
-
         /*
          * 唤醒connect()
          */
@@ -394,79 +355,73 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
             &(sock->wait_cond)
         );
 
-
         pthread_mutex_unlock(
             &(sock->recv_lock)
         );
 
-
         return 0;
+
     }
-
-
-
-
     /*
      * 情况3：
      * server收到ACK
      *
      * SYN_RECV
      *
-     *        ACK
+     * ACK
      * <------------
      *
      * ESTABLISHED
      */
+
     if(sock->state == SYN_RECV &&
        (flags & ACK_FLAG_MASK)){
-
-
         printf("server received ACK\n");
-
 
         pthread_mutex_lock(&(sock->recv_lock));
 
-
         sock->state = ESTABLISHED;
 
+        /*
+         * 确保在连接表中
+         */
+
+        int hashval = cal_hash(
+            sock->established_local_addr.ip,
+            sock->established_local_addr.port,
+            sock->established_remote_addr.ip,
+            sock->established_remote_addr.port
+        );
+        established_socks[hashval] = sock;
 
         pthread_cond_signal(
             &(sock->wait_cond)
         );
 
-
         pthread_mutex_unlock(
             &(sock->recv_lock)
         );
 
-
         return 0;
+
     }
 
-
-
     /*
-     * 普通数据包处理
+     * 普通数据包
      */
-
-
     uint32_t data_len =
         get_plen(pkt)-DEFAULT_HEADER_LEN;
 
-
     if(data_len <= 0)
         return 0;
-
-
-
-    pthread_mutex_lock(&(sock->recv_lock));
-
+    pthread_mutex_lock(
+        &(sock->recv_lock)
+    );
 
     if(sock->received_buf == NULL){
 
         sock->received_buf =
             malloc(data_len);
-
     }else{
 
         sock->received_buf =
@@ -476,21 +431,17 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
             );
     }
 
-
-
     memcpy(
         sock->received_buf + sock->received_len,
         pkt + DEFAULT_HEADER_LEN,
         data_len
     );
 
-
     sock->received_len += data_len;
 
-
-
-    pthread_mutex_unlock(&(sock->recv_lock));
-
+    pthread_mutex_unlock(
+        &(sock->recv_lock)
+    );
 
     return 0;
 }

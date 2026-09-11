@@ -95,7 +95,7 @@ typedef struct {
 
 
 // TJU_TCP 结构体 保存TJU_TCP用到的各种数据
-typedef struct {
+typedef struct tju_tcp {
 	int state; // TCP的状态
 
 	uint32_t seq_num;
@@ -114,6 +114,11 @@ typedef struct {
 	int received_len; // 接收数据缓存长度
 
 	pthread_cond_t wait_cond; // 可以被用来唤醒recv函数调用时等待的线程
+
+	/* Connection handoff from a listener to tju_accept(). */
+	struct tju_tcp* pending_conn;
+	/* Listener owning a connection that is completing the handshake. */
+	struct tju_tcp* listener;
 
 	window_t window; // 发送和接受窗口
 

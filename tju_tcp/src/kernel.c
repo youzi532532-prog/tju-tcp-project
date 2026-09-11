@@ -1,4 +1,5 @@
 #include "kernel.h"
+#include <errno.h>
 /*
 模拟Linux内核收到一份TCP报文的处理函数
 */
@@ -8,8 +9,9 @@ void onTCPPocket(char* pkt){
     uint16_t local_port = get_dst(pkt);
     // remote ip 和 local ip 是读IP 数据包得到的 仿真的话这里直接根据hostname判断
 
-    char hostname[8];
-    gethostname(hostname, 8);
+    char hostname[64] = {0};
+    if (gethostname(hostname, sizeof(hostname) - 1) != 0)
+        hostname[0] = '\0';
     uint32_t remote_ip, local_ip;
     if(strcmp(hostname,"server")==0){ // 自己是服务端 远端就是客户端
         local_ip = inet_network(SERVER_IP);
@@ -17,6 +19,9 @@ void onTCPPocket(char* pkt){
     }else if(strcmp(hostname,"client")==0){ // 自己是客户端 远端就是服务端 
         local_ip = inet_network(CLIENT_IP);
         remote_ip = inet_network(SERVER_IP);
+    }else{
+        fprintf(stderr, "onTCPPocket: unexpected hostname '%s'\n", hostname);
+        return;
     }
 
     int hashval;
@@ -55,10 +60,11 @@ void sendToLayer3(char* packet_buf, int packet_len){
     }
 
     // 获取hostname 根据hostname 判断是客户端还是服务端
-    char hostname[8];
-    gethostname(hostname, 8);
+    char hostname[64] = {0};
+    gethostname(hostname, sizeof(hostname) - 1);
 
     struct sockaddr_in conn;
+    memset(&conn, 0, sizeof(conn));
     conn.sin_family      = AF_INET;            
     conn.sin_port        = htons(20218);
     int rst;
@@ -72,6 +78,8 @@ void sendToLayer3(char* packet_buf, int packet_len){
         printf("请不要改动hostname...\n");
         exit(-1);
     }
+    if (rst < 0)
+        fprintf(stderr, "sendToLayer3: sendto failed: %s\n", strerror(errno));
 }
 
 /*

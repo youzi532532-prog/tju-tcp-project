@@ -28,6 +28,8 @@
 #define TIMEOUT 2
 #define TRUE 1
 #define FALSE 0
+#define ZERO_PROBE_EXT 0x1
+#define PERSIST_MAX_MS 60000
 
 // 定义最大包长 防止IP层分片
 #define MAX_DLEN 1375 	// 最大包内数据长度
@@ -50,6 +52,8 @@
 #define SLOW_START 0
 #define CONGESTION_AVOIDANCE 1
 #define FAST_RECOVERY 2
+#define RECV_BUFFER_CAPACITY ((size_t)5000 * MAX_DLEN)
+#define SEND_BUFFER_CAPACITY ((size_t)5000 * MAX_DLEN)
 
 // TCP 接受窗口大小
 #define TCP_RECVWN_SIZE 32*MAX_DLEN // 比如最多放32个满载数据包
@@ -58,6 +62,7 @@
 // 注释的内容如果想用就可以用 不想用就删掉 仅仅提供思路和灵感
 typedef struct {
 	uint16_t window_size;
+	size_t buffer_capacity;
 	uint32_t snd_una;
 	uint32_t snd_nxt;
 	uint16_t peer_wnd;
@@ -67,6 +72,11 @@ typedef struct {
 	uint32_t rttvar_ms;
 	int timer_running;
 	int has_rtt_sample;
+	uint32_t last_ack;
+	uint32_t dup_ack_count;
+	int fast_retransmit_done;
+	int persist_active;
+	uint32_t persist_interval_ms;
 
 //   uint32_t base;
 //   uint32_t nextseq;
@@ -96,10 +106,11 @@ typedef struct send_segment {
 typedef struct {
 	char received[TCP_RECVWN_SIZE];
 	uint32_t rcv_nxt;
-	uint16_t capacity;
-	uint16_t used;
+	size_t capacity;
+	size_t used;
 	uint16_t advertised_wnd;
 	struct recv_segment *ooo_head;
+	size_t ooo_used;
 
 //   received_packet_t* head;
 //   char buf[TCP_RECVWN_SIZE];

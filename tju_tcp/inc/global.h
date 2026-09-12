@@ -66,6 +66,7 @@ typedef struct {
 	uint32_t srtt_ms;
 	uint32_t rttvar_ms;
 	int timer_running;
+	int has_rtt_sample;
 
 //   uint32_t base;
 //   uint32_t nextseq;
@@ -78,7 +79,17 @@ typedef struct {
 //   int congestion_status;
 //   uint16_t cwnd; 
 //   uint16_t ssthresh; 
+    struct timeval send_time;
 } sender_window_t;
+
+typedef struct send_segment {
+    uint32_t seq;
+    uint16_t len;
+    char *data;
+    struct timeval send_time;
+    int retransmitted;
+    struct send_segment *next;
+} send_segment_t;
 
 // TCP 接受窗口
 // 注释的内容如果想用就可以用 不想用就删掉 仅仅提供思路和灵感
@@ -88,12 +99,20 @@ typedef struct {
 	uint16_t capacity;
 	uint16_t used;
 	uint16_t advertised_wnd;
+	struct recv_segment *ooo_head;
 
 //   received_packet_t* head;
 //   char buf[TCP_RECVWN_SIZE];
 //   uint8_t marked[TCP_RECVWN_SIZE];
 //   uint32_t expect_seq;
 } receiver_window_t;
+
+typedef struct recv_segment {
+    uint32_t seq;
+    uint16_t len;
+    char *data;
+    struct recv_segment *next;
+} recv_segment_t;
 
 // TCP 窗口 每个建立了连接的TCP都包括发送和接受两个窗口
 typedef struct {
@@ -120,6 +139,7 @@ typedef struct tju_tcp {
 
 	pthread_mutex_t send_lock; // 发送数据锁
 	char* sending_buf; // 发送数据缓存区
+	send_segment_t *send_segments;
 	int sending_len; // 发送数据缓存长度
 
 	pthread_mutex_t recv_lock; // 接收数据锁

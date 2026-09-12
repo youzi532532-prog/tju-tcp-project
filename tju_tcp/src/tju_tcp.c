@@ -25,8 +25,14 @@ tju_tcp_t* tju_socket(){
         exit(-1);
     }
 
-    sock->window.wnd_send = NULL;
-    sock->window.wnd_recv = NULL;
+    sock->window.wnd_send = calloc(1, sizeof(sender_window_t));
+    sock->window.wnd_recv = calloc(1, sizeof(receiver_window_t));
+    sock->window.wnd_send->window_size = 1;
+    sock->window.wnd_send->mss = MAX_DLEN;
+    sock->window.wnd_send->peer_wnd = TCP_RECVWN_SIZE;
+    sock->window.wnd_send->rto_ms = 1000;
+    sock->window.wnd_recv->capacity = TCP_RECVWN_SIZE;
+    sock->window.wnd_recv->advertised_wnd = TCP_RECVWN_SIZE;
 
     sock->pending_conn = NULL;
     sock->listener = NULL;
@@ -199,6 +205,9 @@ int tju_connect(tju_tcp_t* sock, tju_sock_addr target_addr){
      */
     sock->seq_num++;
 
+    sock->window.wnd_send->snd_una = sock->seq_num;
+    sock->window.wnd_send->snd_nxt = sock->seq_num;
+
 
 
     /*
@@ -225,19 +234,48 @@ int tju_connect(tju_tcp_t* sock, tju_sock_addr target_addr){
 }
 int tju_send(tju_tcp_t* sock, const void *buffer, int len){
     // 这里当然不能直接简单地调用sendToLayer3
-    char* data = malloc(len);
-    memcpy(data, buffer, len);
-
-    char* msg;
-    uint32_t seq = 464;
-    uint16_t plen = DEFAULT_HEADER_LEN + len;
-
-    msg = create_packet_buf(sock->established_local_addr.port, sock->established_remote_addr.port, seq, 0, 
-              DEFAULT_HEADER_LEN, plen, NO_FLAG, 1, 0, data, len);
-
-    sendToLayer3(msg, plen);
-    
-    return 0;
+    if (sock == NULL || buffer == NULL || len <= 0 || sock->state != ESTABLISHED)
+        return -1;
+    pthread_mutex_lock(&(sock->send_lock));
+    int offset = 0;
+    while (offset < len) {
+        int data_len = len - offset;
+        if (data_len > MAX_DLEN) data_len = MAX_DLEN;
+        pthread_mutex_lock(&(sock->recv_lock));
+        uint32_t seq = sock->window.wnd_send->snd_nxt;
+        sock->sending_buf = malloc(data_len);
+        if (sock->sending_buf == NULL) {
+            pthread_mutex_unlock(&(sock->recv_lock));
+            pthread_mutex_unlock(&(sock->send_lock));
+            return -1;
+        }
+        memcpy(sock->sending_buf, (const char *)buffer + offset, data_len);
+        sock->sending_len = data_len;
+        sock->window.wnd_send->snd_nxt = seq + data_len;
+        printf("[RDT][SEND] seq=%u len=%d snd_una=%u snd_nxt=%u\n",
+               seq, data_len, sock->window.wnd_send->snd_una,
+               sock->window.wnd_send->snd_nxt);
+        pthread_mutex_unlock(&(sock->recv_lock));
+        uint16_t plen = DEFAULT_HEADER_LEN + data_len;
+        char *msg = create_packet_buf(sock->established_local_addr.port,
+            sock->established_remote_addr.port, seq, sock->ack_num,
+            DEFAULT_HEADER_LEN, plen, ACK_FLAG_MASK, 1, 0,
+            sock->sending_buf, data_len);
+        sendToLayer3(msg, plen);
+        free(msg);
+        printf("[RDT][WAIT_ACK] seq_end=%u\n", seq + (uint32_t)data_len);
+        pthread_mutex_lock(&(sock->recv_lock));
+        while (sock->window.wnd_send->snd_una < seq + (uint32_t)data_len)
+            pthread_cond_wait(&(sock->wait_cond), &(sock->recv_lock));
+        free(sock->sending_buf);
+        sock->sending_buf = NULL;
+        sock->sending_len = 0;
+        pthread_mutex_unlock(&(sock->recv_lock));
+        printf("[RDT][ACKED] ack=%u\n", seq + (uint32_t)data_len);
+        offset += data_len;
+    }
+    pthread_mutex_unlock(&(sock->send_lock));
+    return len;
 }
 int tju_recv(tju_tcp_t* sock, void *buffer, int len){
     while(sock->received_len<=0){
@@ -315,6 +353,7 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
         // client SYN占用一个序号
         new_conn->ack_num =
             get_seq(pkt)+1;
+        new_conn->window.wnd_recv->rcv_nxt = new_conn->ack_num;
         // server初始序号
         new_conn->seq_num = 100;
         /*
@@ -361,6 +400,8 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
          * SYN消耗一个序号
          */
         new_conn->seq_num++;
+        new_conn->window.wnd_send->snd_una = new_conn->seq_num;
+        new_conn->window.wnd_send->snd_nxt = new_conn->seq_num;
         return 0;
     }
 
@@ -388,6 +429,7 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
          */
         sock->ack_num =
             get_seq(pkt)+1;
+        sock->window.wnd_recv->rcv_nxt = sock->ack_num;
         /*
          * 回复ACK
          */
@@ -494,8 +536,22 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
     /*
      * 普通数据包
      */
-    uint32_t data_len =
-        get_plen(pkt)-DEFAULT_HEADER_LEN;
+    if (sock->state == ESTABLISHED && (flags & ACK_FLAG_MASK)) {
+        uint32_t ack = get_ack(pkt);
+        pthread_mutex_lock(&(sock->recv_lock));
+        if (ack > sock->window.wnd_send->snd_una) {
+            sock->window.wnd_send->snd_una = ack;
+            printf("[RDT][ACK_RX] ack=%u snd_una=%u\n", ack,
+                   sock->window.wnd_send->snd_una);
+            pthread_cond_broadcast(&(sock->wait_cond));
+        }
+        pthread_mutex_unlock(&(sock->recv_lock));
+    }
+
+    uint16_t plen = get_plen(pkt);
+    if (plen < DEFAULT_HEADER_LEN)
+        return -1;
+    uint32_t data_len = plen - DEFAULT_HEADER_LEN;
 
     if(data_len <= 0)
         return 0;
@@ -523,6 +579,17 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
     );
 
     sock->received_len += data_len;
+    sock->ack_num = get_seq(pkt) + data_len;
+    sock->window.wnd_recv->rcv_nxt = sock->ack_num;
+    printf("[RDT][RECV] seq=%u len=%u next_ack=%u\n",
+           get_seq(pkt), data_len, sock->ack_num);
+    char *ack_pkt = create_packet_buf(sock->established_local_addr.port,
+        sock->established_remote_addr.port, sock->seq_num, sock->ack_num,
+        DEFAULT_HEADER_LEN, DEFAULT_HEADER_LEN, ACK_FLAG_MASK, 1, 0,
+        NULL, 0);
+    sendToLayer3(ack_pkt, DEFAULT_HEADER_LEN);
+    free(ack_pkt);
+    pthread_cond_broadcast(&(sock->wait_cond));
 
     pthread_mutex_unlock(
         &(sock->recv_lock)

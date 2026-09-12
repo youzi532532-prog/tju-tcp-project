@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <sys/select.h>
 #include <arpa/inet.h>
+#include <time.h>
 
 // 单位是byte
 #define SIZE32 4
@@ -57,6 +58,14 @@
 // 注释的内容如果想用就可以用 不想用就删掉 仅仅提供思路和灵感
 typedef struct {
 	uint16_t window_size;
+	uint32_t snd_una;
+	uint32_t snd_nxt;
+	uint16_t peer_wnd;
+	uint16_t mss;
+	uint32_t rto_ms;
+	uint32_t srtt_ms;
+	uint32_t rttvar_ms;
+	int timer_running;
 
 //   uint32_t base;
 //   uint32_t nextseq;
@@ -75,6 +84,10 @@ typedef struct {
 // 注释的内容如果想用就可以用 不想用就删掉 仅仅提供思路和灵感
 typedef struct {
 	char received[TCP_RECVWN_SIZE];
+	uint32_t rcv_nxt;
+	uint16_t capacity;
+	uint16_t used;
+	uint16_t advertised_wnd;
 
 //   received_packet_t* head;
 //   char buf[TCP_RECVWN_SIZE];

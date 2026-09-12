@@ -3,6 +3,7 @@
 
 static uint16_t refresh_advertised_window(tju_tcp_t *sock);
 static void tx_ack(tju_tcp_t *sock);
+static void start_rto_timer(sender_window_t *wnd);
 
 /*
 创建 TCP socket 
@@ -36,7 +37,8 @@ tju_tcp_t* tju_socket(){
     sock->window.wnd_send->buffer_capacity = SEND_BUFFER_CAPACITY;
     sock->window.wnd_send->mss = MAX_DLEN;
     sock->window.wnd_send->peer_wnd = UINT16_MAX;
-    sock->window.wnd_send->rto_ms = 1000;
+    sock->window.wnd_send->rto_ms = RTO_MIN_MS;
+    sock->window.wnd_send->timer_running = 0;
     sock->window.wnd_send->has_rtt_sample = 0;
     sock->window.wnd_send->last_ack = 0;
     sock->window.wnd_send->dup_ack_count = 0;
@@ -366,6 +368,11 @@ int tju_send(tju_tcp_t* sock, const void *buffer, int len){
             while (tail->next != NULL) tail = tail->next;
             tail->next = pending;
         }
+        if (!sock->window.wnd_send->timer_running) {
+            start_rto_timer(sock->window.wnd_send);
+            printf("[RDT][RTO_TIMER_START] seq=%u rto_ms=%u\n",
+                   seq, sock->window.wnd_send->rto_ms);
+        }
         printf("[RDT][TIMER_START] seq=%u timestamp=%ld.%06ld\n", seq,
                (long)sock->window.wnd_send->send_time.tv_sec,
                (long)sock->window.wnd_send->send_time.tv_usec);
@@ -386,7 +393,8 @@ int tju_send(tju_tcp_t* sock, const void *buffer, int len){
         printf("[FLOW][RWND_TX] free=%zu advertised=%u\n",
                sock->window.wnd_recv->capacity - sock->window.wnd_recv->used,
                advertised);
-        static uint32_t drop_seq = 1376;
+        /* Temporary RTO test hook: drop the single test segment (seq=1) once. */
+        static uint32_t drop_seq = 1;
 
         if (seq == drop_seq) {
             printf("[RDT][TEST_DROP] seq=%u\n", seq);
@@ -400,22 +408,35 @@ int tju_send(tju_tcp_t* sock, const void *buffer, int len){
         offset += data_len;
     }
     pthread_mutex_lock(&(sock->recv_lock));
+    if (sock->send_segments != NULL &&
+        !sock->window.wnd_send->timer_running) {
+        start_rto_timer(sock->window.wnd_send);
+        printf("[RDT][RTO_TIMER_START] seq=%u rto_ms=%u\n",
+               sock->send_segments->seq,
+               sock->window.wnd_send->rto_ms);
+    }
     while (sock->window.wnd_send->snd_una < sock->window.wnd_send->snd_nxt) {
-        struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec += sock->window.wnd_send->rto_ms / 1000;
-        deadline.tv_nsec += (sock->window.wnd_send->rto_ms % 1000) * 1000000L;
-        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
-        if (pthread_cond_timedwait(&(sock->wait_cond), &(sock->recv_lock), &deadline) == ETIMEDOUT) {
+        sender_window_t *wnd = sock->window.wnd_send;
+        int wait_rc = pthread_cond_timedwait(&(sock->wait_cond),
+                                             &(sock->recv_lock),
+                                             &wnd->rto_deadline);
+        if (wait_rc == ETIMEDOUT) {
             send_segment_t *pending = sock->send_segments;
             if (pending == NULL) continue;
             uint32_t rseq = pending->seq;
             int rlen = pending->len;
+            printf("[RDT][RTO_TIMEOUT] seq=%u rto_ms=%u\n",
+                   rseq, wnd->rto_ms);
+            /* Keep the historical marker for existing test scripts. */
             printf("[RDT][TIMEOUT] seq=%u\n", rseq);
-            uint32_t old_rto = sock->window.wnd_send->rto_ms;
-            sock->window.wnd_send->rto_ms *= 2;
-            printf("[RDT][RTO_BACKOFF] old_rto=%u new_rto=%u\n",
-                   old_rto, sock->window.wnd_send->rto_ms);
+            uint32_t old_rto = wnd->rto_ms;
+            uint64_t backed_off = (uint64_t)old_rto * 2;
+            wnd->rto_ms = (backed_off > RTO_MAX_MS) ?
+                RTO_MAX_MS : (uint32_t)backed_off;
+            if (wnd->rto_ms < RTO_MIN_MS)
+                wnd->rto_ms = RTO_MIN_MS;
+            printf("[RDT][RTO_BACKOFF] old_ms=%u new_ms=%u\n",
+                   old_rto, wnd->rto_ms);
             char *retry = create_packet_buf(sock->established_local_addr.port,
                 sock->established_remote_addr.port, rseq, sock->ack_num,
                 DEFAULT_HEADER_LEN, DEFAULT_HEADER_LEN + rlen,
@@ -425,8 +446,10 @@ int tju_send(tju_tcp_t* sock, const void *buffer, int len){
             free(retry);
             gettimeofday(&pending->send_time, NULL);
             pending->retransmitted = 1;
+            start_rto_timer(wnd);
         }
     }
+    sock->window.wnd_send->timer_running = 0;
     free(sock->sending_buf);
     sock->sending_buf = NULL;
     sock->sending_len = 0;
@@ -477,6 +500,22 @@ static void append_received(tju_tcp_t *sock, const char *data, uint32_t len){
     sock->received_buf = realloc(sock->received_buf, sock->received_len + len);
     memcpy(sock->received_buf + sock->received_len, data, len);
     sock->received_len += len;
+}
+
+/* Store an absolute deadline so condition-variable wakeups (including
+   duplicate ACKs) do not restart the RTO from the current time. */
+static void start_rto_timer(sender_window_t *wnd){
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    wnd->rto_deadline = now;
+    wnd->rto_deadline.tv_sec += wnd->rto_ms / 1000;
+    wnd->rto_deadline.tv_nsec +=
+        (long)(wnd->rto_ms % 1000) * 1000000L;
+    if (wnd->rto_deadline.tv_nsec >= 1000000000L) {
+        wnd->rto_deadline.tv_sec++;
+        wnd->rto_deadline.tv_nsec -= 1000000000L;
+    }
+    wnd->timer_running = 1;
 }
 
 static uint16_t refresh_advertised_window(tju_tcp_t *sock){
@@ -823,12 +862,20 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
                         sock->window.wnd_send->srtt_ms =
                             (7 * sock->window.wnd_send->srtt_ms + rtt) / 8;
                     }
-                    sock->window.wnd_send->rto_ms = sock->window.wnd_send->srtt_ms +
-                        ((4 * sock->window.wnd_send->rttvar_ms > 1) ?
-                         4 * sock->window.wnd_send->rttvar_ms : 1);
-                    printf("[RDT][RTT_UPDATE] srtt_ms=%u rttvar_ms=%u rto_ms=%u\n",
+                    uint64_t raw_rto =
+                        (uint64_t)sock->window.wnd_send->srtt_ms +
+                        ((4ULL * sock->window.wnd_send->rttvar_ms > 1) ?
+                         4 * (uint64_t)sock->window.wnd_send->rttvar_ms : 1);
+                    uint64_t bounded_rto = raw_rto;
+                    if (bounded_rto < RTO_MIN_MS)
+                        bounded_rto = RTO_MIN_MS;
+                    if (bounded_rto > RTO_MAX_MS)
+                        bounded_rto = RTO_MAX_MS;
+                    sock->window.wnd_send->rto_ms = (uint32_t)bounded_rto;
+                    printf("[RDT][RTT_UPDATE] srtt_ms=%u rttvar_ms=%u raw_rto_ms=%llu rto_ms=%u\n",
                            sock->window.wnd_send->srtt_ms,
                            sock->window.wnd_send->rttvar_ms,
+                           (unsigned long long)raw_rto,
                            sock->window.wnd_send->rto_ms);
                 }
             }
@@ -855,6 +902,13 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
             sock->window.wnd_send->last_ack = ack;
             sock->window.wnd_send->dup_ack_count = 0;
             sock->window.wnd_send->fast_retransmit_done = 0;
+            if (sock->send_segments != NULL) {
+                start_rto_timer(sock->window.wnd_send);
+                printf("[RDT][RTO_TIMER_RESTART] ack=%u rto_ms=%u\n",
+                       ack, sock->window.wnd_send->rto_ms);
+            } else {
+                sock->window.wnd_send->timer_running = 0;
+            }
             pthread_cond_broadcast(&(sock->wait_cond));
         } else if (ack == sock->window.wnd_send->snd_una &&
                    sock->send_segments != NULL) {

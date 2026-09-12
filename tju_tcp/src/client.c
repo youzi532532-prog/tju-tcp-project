@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
 
     sleep(3);
 
-    size_t total_len = (size_t)MAX_DLEN * 6000;
+    size_t total_len = (size_t)MAX_DLEN;
     char *data = malloc(total_len);
 
     if (data == NULL) {
@@ -39,20 +39,13 @@ int main(int argc, char **argv) {
 
     memset(data, 'A', total_len);
 
-    printf("[TEST] client send len=%zu bytes, segments=%zu\n",
-        total_len,
-        (total_len + MAX_DLEN - 1) / MAX_DLEN);
+    printf("[TEST][RTO] send one segment len=%zu\n", total_len);
+    printf("[TEST][RTO] expect first transmission dropped\n");
+    fflush(stdout);
 
     tju_send(my_socket, data, total_len);
 
     free(data);
-
-    char buf[2021];
-    tju_recv(my_socket, (void*)buf, 12);
-    printf("client recv %s\n", buf);
-
-    tju_recv(my_socket, (void*)buf, 10);
-    printf("client recv %s\n", buf);
 
     return EXIT_SUCCESS;
 }

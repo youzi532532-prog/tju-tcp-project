@@ -30,6 +30,9 @@
 #define FALSE 0
 #define ZERO_PROBE_EXT 0x1
 #define PERSIST_MAX_MS 60000
+#define RTO_MIN_MS 1000
+/* Project safety bound; RFC 6298 describes 60s as an upper-bound choice. */
+#define RTO_MAX_MS 60000
 
 // 定义最大包长 防止IP层分片
 #define MAX_DLEN 1375 	// 最大包内数据长度
@@ -71,6 +74,7 @@ typedef struct {
 	uint32_t srtt_ms;
 	uint32_t rttvar_ms;
 	int timer_running;
+	struct timespec rto_deadline;
 	int has_rtt_sample;
 	uint32_t last_ack;
 	uint32_t dup_ack_count;

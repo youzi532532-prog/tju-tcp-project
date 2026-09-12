@@ -11,11 +11,16 @@ OBJS = $(BUILD_DIR)/tju_packet.o \
 
 
 
-default:all
+.PHONY: default all clean
 
-all: clean server client
+default: all
 
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c 
+all: server client
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(FLAGS) -c -o $@ $<
 
 clean:
@@ -24,7 +29,7 @@ clean:
 server: $(OBJS)
 	$(CC) $(FLAGS) ./src/server.c -o server $(OBJS)
 
-client:
+client: $(OBJS)
 	$(CC) $(FLAGS) ./src/client.c -o client $(OBJS) 
 
 

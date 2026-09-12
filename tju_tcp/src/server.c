@@ -32,17 +32,31 @@ int main(int argc, char **argv) {
     // printf("new_conn established_remote_addr ip %d port %d\n", conn_ip, conn_port);
 
 
-    sleep(5);
-    
-    tju_send(new_conn, "hello world", 12);
-    tju_send(new_conn, "hello tju", 10);
+    /* Zero-window test: keep the application from draining received data so
+       the advertised window can reach zero. */
+    printf("[TEST][FLOW] server start, stop reading\n");
+    printf("[TEST][FLOW] WAIT_BEFORE_RECV\n");
+    fflush(stdout);
+    sleep(10);
 
-    char buf[2021];
-    tju_recv(new_conn, (void*)buf, 12);
-    printf("server recv %s\n", buf);
+    size_t recv_len = (size_t)MAX_DLEN * 100;
+    char *buf = malloc(recv_len);
+    if (buf == NULL) {
+        perror("malloc");
+        return EXIT_FAILURE;
+    }
+    printf("[TEST][FLOW] BEFORE_RECV received_len=%d expected_release=%zu\n",
+           new_conn->received_len, recv_len);
+    fflush(stdout);
+    int consumed = tju_recv(new_conn, buf, (int)recv_len);
+    printf("[TEST][FLOW] AFTER_RECV n=%d\n", consumed);
+    fflush(stdout);
+    free(buf);
 
-    tju_recv(new_conn, (void*)buf, 10);
-    printf("server recv %s\n", buf);
+    printf("[TEST][FLOW] KEEP_ALIVE\n");
+    fflush(stdout);
+    while (1)
+        sleep(1);
 
 
     return EXIT_SUCCESS;

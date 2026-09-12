@@ -1,6 +1,6 @@
 #include "tju_tcp.h"
 #include <string.h>
-
+#include <stdlib.h>
 
 int main(int argc, char **argv) {
     // 开启仿真环境 
@@ -29,8 +29,23 @@ int main(int argc, char **argv) {
 
     sleep(3);
 
-    tju_send(my_socket, "hello world", 12);
-    tju_send(my_socket, "hello tju", 10);
+    size_t total_len = (size_t)MAX_DLEN * 6000;
+    char *data = malloc(total_len);
+
+    if (data == NULL) {
+        perror("malloc");
+        return EXIT_FAILURE;
+    }
+
+    memset(data, 'A', total_len);
+
+    printf("[TEST] client send len=%zu bytes, segments=%zu\n",
+        total_len,
+        (total_len + MAX_DLEN - 1) / MAX_DLEN);
+
+    tju_send(my_socket, data, total_len);
+
+    free(data);
 
     char buf[2021];
     tju_recv(my_socket, (void*)buf, 12);

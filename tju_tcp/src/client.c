@@ -29,7 +29,8 @@ int main(int argc, char **argv) {
 
     sleep(3);
 
-    size_t total_len = (size_t)MAX_DLEN;
+    /* Small close test payload. */
+    size_t total_len = (size_t)MAX_DLEN * 8;
     char *data = malloc(total_len);
 
     if (data == NULL) {
@@ -39,13 +40,15 @@ int main(int argc, char **argv) {
 
     memset(data, 'A', total_len);
 
-    printf("[TEST][RTO] send one segment len=%zu\n", total_len);
-    printf("[TEST][RTO] expect first transmission dropped\n");
+    printf("[TEST][CLOSE] send data len=%zu segments=%zu\n",
+           total_len, (total_len + MAX_DLEN - 1) / MAX_DLEN);
+    printf("[TEST][CLOSE] passive close after peer FIN\n");
     fflush(stdout);
 
     tju_send(my_socket, data, total_len);
 
     free(data);
+    tju_close(my_socket);
 
     return EXIT_SUCCESS;
 }

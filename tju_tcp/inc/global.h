@@ -33,6 +33,12 @@
 #define RTO_MIN_MS 1000
 /* Project safety bound; RFC 6298 describes 60s as an upper-bound choice. */
 #define RTO_MAX_MS 60000
+#define TIME_WAIT_MSL_MS 1000
+#define TEST_DROP_FIN 0
+/* Disable high-frequency per-packet traces for throughput tests. */
+#ifndef DEBUG_RDT_VERBOSE
+#define DEBUG_RDT_VERBOSE 0
+#endif
 
 // 定义最大包长 防止IP层分片
 #define MAX_DLEN 1375 	// 最大包内数据长度
@@ -79,6 +85,14 @@ typedef struct {
 	uint32_t last_ack;
 	uint32_t dup_ack_count;
 	int fast_retransmit_done;
+	int recovery_active;
+	int recovery_retransmitted;
+	uint32_t recovery_end_seq;
+	uint64_t total_ack_packets;
+	uint64_t advancing_acks;
+	uint64_t duplicate_acks;
+	uint64_t stale_acks;
+	uint64_t fast_retransmits;
 	int persist_active;
 	uint32_t persist_interval_ms;
 
@@ -102,6 +116,7 @@ typedef struct send_segment {
     char *data;
     struct timeval send_time;
     int retransmitted;
+    int is_fin;
     struct send_segment *next;
 } send_segment_t;
 
@@ -113,6 +128,7 @@ typedef struct {
 	size_t capacity;
 	size_t used;
 	uint16_t advertised_wnd;
+	uint64_t advertised_right_edge;
 	struct recv_segment *ooo_head;
 	size_t ooo_used;
 
@@ -162,11 +178,19 @@ typedef struct tju_tcp {
 	int received_len; // 接收数据缓存长度
 
 	pthread_cond_t wait_cond; // 可以被用来唤醒recv函数调用时等待的线程
+	pthread_cond_t rto_cond;  // ordinary-data RTO worker only
+	int rto_worker_started;
 
 	/* Connection handoff from a listener to tju_accept(). */
 	struct tju_tcp* pending_conn;
 	/* Listener owning a connection that is completing the handshake. */
 	struct tju_tcp* listener;
+
+	/* FIN/close state. */
+	int fin_sent;
+	int fin_received;
+	int fin_acked;
+	uint32_t fin_seq;
 
 	window_t window; // 发送和接受窗口
 

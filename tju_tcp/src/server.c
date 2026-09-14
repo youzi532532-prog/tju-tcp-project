@@ -32,31 +32,38 @@ int main(int argc, char **argv) {
     // printf("new_conn established_remote_addr ip %d port %d\n", conn_ip, conn_port);
 
 
-    /* Zero-window test: keep the application from draining received data so
-       the advertised window can reach zero. */
-    printf("[TEST][FLOW] server start, stop reading\n");
-    printf("[TEST][FLOW] WAIT_BEFORE_RECV\n");
-    fflush(stdout);
-    sleep(10);
-
-    size_t recv_len = (size_t)MAX_DLEN * 100;
+    size_t recv_len = (size_t)MAX_DLEN * 8;
     char *buf = malloc(recv_len);
     if (buf == NULL) {
         perror("malloc");
         return EXIT_FAILURE;
     }
-    printf("[TEST][FLOW] BEFORE_RECV received_len=%d expected_release=%zu\n",
+
+    /* tju_recv() is an application read; wait until the complete test
+       payload has arrived before actively closing.  This keeps the close
+       test from sending FIN while the peer still has data in flight. */
+    printf("[TEST][CLOSE] waiting for expected data=%zu\n", recv_len);
+    fflush(stdout);
+    pthread_mutex_lock(&(new_conn->recv_lock));
+    while ((size_t)new_conn->received_len < recv_len &&
+           new_conn->state != CLOSED) {
+        pthread_cond_wait(&(new_conn->wait_cond), &(new_conn->recv_lock));
+    }
+    printf("[TEST][CLOSE] data ready received_len=%d expected=%zu\n",
+           new_conn->received_len, recv_len);
+    pthread_mutex_unlock(&(new_conn->recv_lock));
+
+    printf("[TEST][CLOSE] BEFORE_RECV received_len=%d expected=%zu\n",
            new_conn->received_len, recv_len);
     fflush(stdout);
     int consumed = tju_recv(new_conn, buf, (int)recv_len);
-    printf("[TEST][FLOW] AFTER_RECV n=%d\n", consumed);
+    printf("[TEST][CLOSE] AFTER_RECV n=%d\n", consumed);
     fflush(stdout);
     free(buf);
 
-    printf("[TEST][FLOW] KEEP_ALIVE\n");
+    printf("[TEST][CLOSE] active close\n");
     fflush(stdout);
-    while (1)
-        sleep(1);
+    tju_close(new_conn);
 
 
     return EXIT_SUCCESS;

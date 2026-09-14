@@ -1,9 +1,18 @@
 #include "tju_tcp.h"
 #include <errno.h>
 
+#define RDT_VERBOSE(...) do { \
+    if (DEBUG_RDT_VERBOSE) printf(__VA_ARGS__); \
+} while (0)
+
 static uint16_t refresh_advertised_window(tju_tcp_t *sock);
 static void tx_ack(tju_tcp_t *sock);
 static void start_rto_timer(sender_window_t *wnd);
+static void send_fin(tju_tcp_t *sock);
+static void enter_time_wait(tju_tcp_t *sock);
+static const char *close_state_name(int state);
+static void *data_rto_worker(void *arg);
+static void start_data_rto_worker(tju_tcp_t *sock);
 
 /*
 创建 TCP socket 
@@ -30,6 +39,11 @@ tju_tcp_t* tju_socket(){
         perror("ERROR condition variable not set\n");
         exit(-1);
     }
+    if(pthread_cond_init(&sock->rto_cond, NULL) != 0){
+        perror("ERROR RTO condition variable not set\n");
+        exit(-1);
+    }
+    sock->rto_worker_started = 0;
 
     sock->window.wnd_send = calloc(1, sizeof(sender_window_t));
     sock->window.wnd_recv = calloc(1, sizeof(receiver_window_t));
@@ -43,16 +57,24 @@ tju_tcp_t* tju_socket(){
     sock->window.wnd_send->last_ack = 0;
     sock->window.wnd_send->dup_ack_count = 0;
     sock->window.wnd_send->fast_retransmit_done = 0;
+    sock->window.wnd_send->recovery_active = 0;
+    sock->window.wnd_send->recovery_retransmitted = 0;
+    sock->window.wnd_send->recovery_end_seq = 0;
     sock->window.wnd_send->persist_active = 0;
     sock->window.wnd_send->persist_interval_ms = 0;
     sock->window.wnd_recv->capacity = RECV_BUFFER_CAPACITY;
     sock->window.wnd_recv->used = 0;
     sock->window.wnd_recv->ooo_used = 0;
     sock->window.wnd_recv->advertised_wnd = UINT16_MAX;
+    sock->window.wnd_recv->advertised_right_edge = 0;
     sock->window.wnd_recv->ooo_head = NULL;
 
     sock->pending_conn = NULL;
     sock->listener = NULL;
+    sock->fin_sent = 0;
+    sock->fin_received = 0;
+    sock->fin_acked = 0;
+    sock->fin_seq = 0;
 
     return sock;
 }
@@ -98,6 +120,7 @@ tju_tcp_t* tju_accept(tju_tcp_t* listen_sock){
     tju_tcp_t* accepted_conn = listen_sock->pending_conn;
     listen_sock->pending_conn = NULL;
     pthread_mutex_unlock(&(listen_sock->recv_lock));
+    start_data_rto_worker(accepted_conn);
     return accepted_conn;
 
 #if 0
@@ -247,6 +270,7 @@ int tju_connect(tju_tcp_t* sock, tju_sock_addr target_addr){
 
     pthread_mutex_unlock(&(sock->recv_lock));
 
+    start_data_rto_worker(sock);
 
     return 0;
 }
@@ -257,16 +281,38 @@ int tju_send(tju_tcp_t* sock, const void *buffer, int len){
     pthread_mutex_lock(&(sock->send_lock));
     int offset = 0;
     while (offset < len) {
-        int data_len = len - offset;
-        if (data_len > MAX_DLEN) data_len = MAX_DLEN;
+        int segment_len = len - offset;
+        if (segment_len > MAX_DLEN) segment_len = MAX_DLEN;
         pthread_mutex_lock(&(sock->recv_lock));
         uint32_t flight = sock->window.wnd_send->snd_nxt - sock->window.wnd_send->snd_una;
         if (sock->window.wnd_send->peer_wnd == 0)
-            printf("[FLOW][SEND_BLOCK_ZERO_WINDOW]\n");
-        while ((uint64_t)flight + (uint32_t)data_len > sock->window.wnd_send->peer_wnd) {
+            RDT_VERBOSE("[FLOW][SEND_BLOCK_ZERO_WINDOW]\n");
+        for (;;) {
+            uint32_t available = sock->window.wnd_send->peer_wnd > flight ?
+                sock->window.wnd_send->peer_wnd - flight : 0;
+            int final_segment = (segment_len < MAX_DLEN && flight == 0);
+            int full_mss_available = (available >= MAX_DLEN);
+            int window_too_small = ((uint64_t)flight + (uint32_t)segment_len >
+                                   sock->window.wnd_send->peer_wnd);
+
+            /* Sender-side SWS avoidance applies only to new application
+               data.  A short final write is allowed when no data is in
+               flight; retransmission code is outside this loop. */
+            if (sock->window.wnd_send->peer_wnd != 0 &&
+                !full_mss_available &&
+                !(final_segment && available >= (uint32_t)segment_len)) {
+                RDT_VERBOSE("[FLOW][SWS_BLOCK] available=%u remaining=%d peer_wnd=%u\n",
+                       available, segment_len, sock->window.wnd_send->peer_wnd);
+            } else if (!window_too_small) {
+                if (full_mss_available)
+                    RDT_VERBOSE("[FLOW][SWS_ALLOW] reason=full_mss\n");
+                else if (final_segment)
+                    RDT_VERBOSE("[FLOW][SWS_ALLOW] reason=final_segment\n");
+                break;
+            }
             if (sock->window.wnd_send->peer_wnd == 0)
-                printf("[FLOW][SEND_BLOCK_ZERO_WINDOW]\n");
-            printf("[FLOW][SEND_WINDOW] flight=%u rwnd=%u allowed=%u\n",
+                RDT_VERBOSE("[FLOW][SEND_BLOCK_ZERO_WINDOW]\n");
+            RDT_VERBOSE("[FLOW][SEND_WINDOW] flight=%u rwnd=%u allowed=%u\n",
                    flight, sock->window.wnd_send->peer_wnd,
                    (sock->window.wnd_send->peer_wnd > flight) ?
                    sock->window.wnd_send->peer_wnd - flight : 0);
@@ -318,32 +364,32 @@ int tju_send(tju_tcp_t* sock, const void *buffer, int len){
             }
             flight = sock->window.wnd_send->snd_nxt - sock->window.wnd_send->snd_una;
         }
-        printf("[FLOW][SEND_WINDOW] flight=%u rwnd=%u allowed=%u\n",
+        RDT_VERBOSE("[FLOW][SEND_WINDOW] flight=%u rwnd=%u allowed=%u\n",
                flight, sock->window.wnd_send->peer_wnd,
                (sock->window.wnd_send->peer_wnd > flight) ?
                sock->window.wnd_send->peer_wnd - flight : 0);
-        printf("[RDT][WINDOW] snd_una=%u snd_nxt=%u window_size=%u flight_size=%u\n",
+        RDT_VERBOSE("[RDT][WINDOW] snd_una=%u snd_nxt=%u window_size=%u flight_size=%u\n",
                sock->window.wnd_send->snd_una, sock->window.wnd_send->snd_nxt,
                sock->window.wnd_send->window_size,
                sock->window.wnd_send->snd_nxt - sock->window.wnd_send->snd_una);
         pthread_mutex_unlock(&(sock->recv_lock));
         pthread_mutex_lock(&(sock->recv_lock));
         uint32_t seq = sock->window.wnd_send->snd_nxt;
-        char *segment = malloc(data_len);
+        char *segment = malloc(segment_len);
         if (segment == NULL) {
             pthread_mutex_unlock(&(sock->recv_lock));
             pthread_mutex_unlock(&(sock->send_lock));
             return -1;
         }
-        memcpy(segment, (const char *)buffer + offset, data_len);
-        if ((size_t)sock->sending_len + (size_t)data_len >
+        memcpy(segment, (const char *)buffer + offset, segment_len);
+        if ((size_t)sock->sending_len + (size_t)segment_len >
             sock->window.wnd_send->buffer_capacity) {
             free(segment);
             pthread_mutex_unlock(&(sock->recv_lock));
             pthread_mutex_unlock(&(sock->send_lock));
             return -1;
         }
-        char *combined = realloc(sock->sending_buf, sock->sending_len + data_len);
+        char *combined = realloc(sock->sending_buf, sock->sending_len + segment_len);
         if (combined == NULL) {
             free(segment);
             pthread_mutex_unlock(&(sock->recv_lock));
@@ -351,15 +397,15 @@ int tju_send(tju_tcp_t* sock, const void *buffer, int len){
             return -1;
         }
         sock->sending_buf = combined;
-        memcpy(sock->sending_buf + sock->sending_len, segment, data_len);
-        sock->sending_len += data_len;
-        sock->window.wnd_send->snd_nxt = seq + data_len;
+        memcpy(sock->sending_buf + sock->sending_len, segment, segment_len);
+        sock->sending_len += segment_len;
+        sock->window.wnd_send->snd_nxt = seq + segment_len;
         gettimeofday(&sock->window.wnd_send->send_time, NULL);
         send_segment_t *pending = calloc(1, sizeof(*pending));
         pending->seq = seq;
-        pending->len = data_len;
-        pending->data = malloc(data_len);
-        memcpy(pending->data, segment, data_len);
+        pending->len = segment_len;
+        pending->data = malloc(segment_len);
+        memcpy(pending->data, segment, segment_len);
         gettimeofday(&pending->send_time, NULL);
         if (sock->send_segments == NULL) {
             sock->send_segments = pending;
@@ -370,31 +416,33 @@ int tju_send(tju_tcp_t* sock, const void *buffer, int len){
         }
         if (!sock->window.wnd_send->timer_running) {
             start_rto_timer(sock->window.wnd_send);
-            printf("[RDT][RTO_TIMER_START] seq=%u rto_ms=%u\n",
+            RDT_VERBOSE("[RDT][RTO_TIMER_START] seq=%u rto_ms=%u\n",
                    seq, sock->window.wnd_send->rto_ms);
         }
-        printf("[RDT][TIMER_START] seq=%u timestamp=%ld.%06ld\n", seq,
+        pthread_cond_signal(&(sock->rto_cond));
+        RDT_VERBOSE("[RDT][TIMER_START] seq=%u timestamp=%ld.%06ld\n", seq,
                (long)sock->window.wnd_send->send_time.tv_sec,
                (long)sock->window.wnd_send->send_time.tv_usec);
-        printf("[RDT][SEND] seq=%u len=%d snd_una=%u snd_nxt=%u\n",
-               seq, data_len, sock->window.wnd_send->snd_una,
+        RDT_VERBOSE("[RDT][SEND] seq=%u len=%d snd_una=%u snd_nxt=%u\n",
+               seq, segment_len, sock->window.wnd_send->snd_una,
                sock->window.wnd_send->snd_nxt);
-        printf("[RDT][WINDOW] snd_una=%u snd_nxt=%u window_size=%u flight_size=%u\n",
+        RDT_VERBOSE("[RDT][WINDOW] snd_una=%u snd_nxt=%u window_size=%u flight_size=%u\n",
                sock->window.wnd_send->snd_una, sock->window.wnd_send->snd_nxt,
                sock->window.wnd_send->window_size,
                sock->window.wnd_send->snd_nxt - sock->window.wnd_send->snd_una);
         pthread_mutex_unlock(&(sock->recv_lock));
-        uint16_t plen = DEFAULT_HEADER_LEN + data_len;
+        /* segment_len is the only payload length used on the wire. */
+        uint16_t plen = DEFAULT_HEADER_LEN + (uint16_t)segment_len;
         uint16_t advertised = refresh_advertised_window(sock);
         char *msg = create_packet_buf(sock->established_local_addr.port,
             sock->established_remote_addr.port, seq, sock->ack_num,
             DEFAULT_HEADER_LEN, plen, ACK_FLAG_MASK, advertised, 0,
-            segment, data_len);
-        printf("[FLOW][RWND_TX] free=%zu advertised=%u\n",
+            segment, segment_len);
+        RDT_VERBOSE("[FLOW][RWND_TX] free=%zu advertised=%u\n",
                sock->window.wnd_recv->capacity - sock->window.wnd_recv->used,
                advertised);
-        /* Temporary RTO test hook: drop the single test segment (seq=1) once. */
-        static uint32_t drop_seq = 1;
+        /* Ordinary data loss disabled for close tests. */
+        static uint32_t drop_seq = 0;
 
         if (seq == drop_seq) {
             printf("[RDT][TEST_DROP] seq=%u\n", seq);
@@ -404,70 +452,35 @@ int tju_send(tju_tcp_t* sock, const void *buffer, int len){
         }
         free(msg);
         free(segment);
-        printf("[RDT][WAIT_ALL_ACK] seq_end=%u\n", seq + (uint32_t)data_len);
-        offset += data_len;
+        RDT_VERBOSE("[RDT][WAIT_ALL_ACK] seq_end=%u\n", seq + (uint32_t)segment_len);
+        offset += segment_len;
     }
-    pthread_mutex_lock(&(sock->recv_lock));
-    if (sock->send_segments != NULL &&
-        !sock->window.wnd_send->timer_running) {
-        start_rto_timer(sock->window.wnd_send);
-        printf("[RDT][RTO_TIMER_START] seq=%u rto_ms=%u\n",
-               sock->send_segments->seq,
-               sock->window.wnd_send->rto_ms);
-    }
-    while (sock->window.wnd_send->snd_una < sock->window.wnd_send->snd_nxt) {
-        sender_window_t *wnd = sock->window.wnd_send;
-        int wait_rc = pthread_cond_timedwait(&(sock->wait_cond),
-                                             &(sock->recv_lock),
-                                             &wnd->rto_deadline);
-        if (wait_rc == ETIMEDOUT) {
-            send_segment_t *pending = sock->send_segments;
-            if (pending == NULL) continue;
-            uint32_t rseq = pending->seq;
-            int rlen = pending->len;
-            printf("[RDT][RTO_TIMEOUT] seq=%u rto_ms=%u\n",
-                   rseq, wnd->rto_ms);
-            /* Keep the historical marker for existing test scripts. */
-            printf("[RDT][TIMEOUT] seq=%u\n", rseq);
-            uint32_t old_rto = wnd->rto_ms;
-            uint64_t backed_off = (uint64_t)old_rto * 2;
-            wnd->rto_ms = (backed_off > RTO_MAX_MS) ?
-                RTO_MAX_MS : (uint32_t)backed_off;
-            if (wnd->rto_ms < RTO_MIN_MS)
-                wnd->rto_ms = RTO_MIN_MS;
-            printf("[RDT][RTO_BACKOFF] old_ms=%u new_ms=%u\n",
-                   old_rto, wnd->rto_ms);
-            char *retry = create_packet_buf(sock->established_local_addr.port,
-                sock->established_remote_addr.port, rseq, sock->ack_num,
-                DEFAULT_HEADER_LEN, DEFAULT_HEADER_LEN + rlen,
-                ACK_FLAG_MASK, refresh_advertised_window(sock), 0, pending->data, rlen);
-            printf("[RDT][RETRANSMIT] seq=%u\n", rseq);
-            sendToLayer3(retry, DEFAULT_HEADER_LEN + rlen);
-            free(retry);
-            gettimeofday(&pending->send_time, NULL);
-            pending->retransmitted = 1;
-            start_rto_timer(wnd);
-        }
-    }
-    sock->window.wnd_send->timer_running = 0;
-    free(sock->sending_buf);
-    sock->sending_buf = NULL;
-    sock->sending_len = 0;
-    printf("[RDT][ACKED] ack=%u\n", sock->window.wnd_send->snd_una);
-    pthread_mutex_unlock(&(sock->recv_lock));
+    /* Data is queued for reliable delivery; ACK/RTO progress continues in
+       the socket worker so successive application writes can be pipelined. */
     pthread_mutex_unlock(&(sock->send_lock));
     return len;
 }
+/* Read up to len bytes and return the number copied; zero denotes EOF. */
 int tju_recv(tju_tcp_t* sock, void *buffer, int len){
-    while(sock->received_len<=0){
-        // 阻塞
+    if (sock == NULL || buffer == NULL || len <= 0)
+        return -1;
+
+    pthread_mutex_lock(&(sock->recv_lock));
+    while (sock->received_len <= 0 &&
+           !sock->fin_received && sock->state != CLOSED) {
+        pthread_cond_wait(&(sock->wait_cond), &(sock->recv_lock));
     }
 
-    while(pthread_mutex_lock(&(sock->recv_lock)) != 0); // 加锁
+    if (sock->received_len <= 0) {
+        RDT_VERBOSE("[RDT][APP_RECV] requested=%d returned=0 remaining=0\n", len);
+        pthread_mutex_unlock(&(sock->recv_lock));
+        return 0;
+    }
 
-    int read_len = 0;
+    size_t read_len = (sock->received_len < len) ?
+        (size_t)sock->received_len : (size_t)len;
     if (sock->received_len >= len){ // 从中读取len长度的数据
-        read_len = len;
+        read_len = (size_t)len;
     }else{
         read_len = sock->received_len; // 读取sock->received_len长度的数据(全读出来)
     }
@@ -475,11 +488,12 @@ int tju_recv(tju_tcp_t* sock, void *buffer, int len){
     memcpy(buffer, sock->received_buf, read_len);
 
     if(read_len < sock->received_len) { // 还剩下一些
-        char* new_buf = malloc(sock->received_len - read_len);
-        memcpy(new_buf, sock->received_buf + read_len, sock->received_len - read_len);
-        free(sock->received_buf);
-        sock->received_len -= read_len;
-        sock->received_buf = new_buf;
+        size_t remaining = (size_t)sock->received_len - read_len;
+        memmove(sock->received_buf, sock->received_buf + read_len, remaining);
+        sock->received_len = (int)remaining;
+        char *shrunk = realloc(sock->received_buf, remaining);
+        if (shrunk != NULL)
+            sock->received_buf = shrunk;
     }else{
         free(sock->received_buf);
         sock->received_buf = NULL;
@@ -491,9 +505,11 @@ int tju_recv(tju_tcp_t* sock, void *buffer, int len){
         printf("[FLOW][WINDOW_UPDATE] old=0 new=%u\n",
                sock->window.wnd_recv->advertised_wnd);
     tx_ack(sock);
+    RDT_VERBOSE("[RDT][APP_RECV] requested=%d returned=%zu remaining=%d\n",
+           len, read_len, sock->received_len);
     pthread_mutex_unlock(&(sock->recv_lock)); // 解锁
 
-    return 0;
+    return (int)read_len;
 }
 
 static void append_received(tju_tcp_t *sock, const char *data, uint32_t len){
@@ -518,12 +534,202 @@ static void start_rto_timer(sender_window_t *wnd){
     wnd->timer_running = 1;
 }
 
+static void start_data_rto_worker(tju_tcp_t *sock){
+    if (sock == NULL) return;
+    pthread_mutex_lock(&(sock->recv_lock));
+    if (sock->rto_worker_started || sock->state != ESTABLISHED) {
+        pthread_mutex_unlock(&(sock->recv_lock));
+        return;
+    }
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, data_rto_worker, sock) == 0) {
+        pthread_detach(thread);
+        sock->rto_worker_started = 1;
+    }
+    pthread_mutex_unlock(&(sock->recv_lock));
+}
+
+/* Keep ordinary-data retransmission independent of the application write
+   call.  This lets tju_send() pipeline successive writes while preserving
+   one oldest-unacked RTO timer.  FIN retransmission remains owned by
+   tju_close(), so close state handling is unchanged. */
+static void *data_rto_worker(void *arg){
+    tju_tcp_t *sock = (tju_tcp_t *)arg;
+    pthread_mutex_lock(&(sock->recv_lock));
+    for (;;) {
+        sender_window_t *wnd = sock->window.wnd_send;
+        if (sock->state == CLOSED) {
+            pthread_mutex_unlock(&(sock->recv_lock));
+            return NULL;
+        }
+        while (!wnd->timer_running || sock->send_segments == NULL ||
+               sock->send_segments->is_fin) {
+            if (sock->state == CLOSED) {
+                pthread_mutex_unlock(&(sock->recv_lock));
+                return NULL;
+            }
+            pthread_cond_wait(&(sock->rto_cond), &(sock->recv_lock));
+        }
+
+        int rc = pthread_cond_timedwait(&(sock->rto_cond),
+                                        &(sock->recv_lock),
+                                        &wnd->rto_deadline);
+        if (rc != ETIMEDOUT || !wnd->timer_running ||
+            sock->send_segments == NULL || sock->send_segments->is_fin)
+            continue;
+
+        send_segment_t *pending = sock->send_segments;
+        uint32_t rseq = pending->seq;
+        int rlen = pending->len;
+        printf("[RDT][RTO_TIMEOUT] seq=%u rto_ms=%u\n", rseq, wnd->rto_ms);
+        printf("[RDT][TIMEOUT] seq=%u\n", rseq);
+        uint32_t old_rto = wnd->rto_ms;
+        /* A timeout starts a new recovery epoch; do not carry the bounded
+           fast-recovery allowance across an RTO retransmission. */
+        wnd->recovery_active = 0;
+        wnd->recovery_retransmitted = 0;
+        uint64_t backed_off = (uint64_t)old_rto * 2;
+        wnd->rto_ms = backed_off > RTO_MAX_MS ?
+            RTO_MAX_MS : (uint32_t)backed_off;
+        if (wnd->rto_ms < RTO_MIN_MS)
+            wnd->rto_ms = RTO_MIN_MS;
+        printf("[RDT][RTO_BACKOFF] old_ms=%u new_ms=%u\n",
+               old_rto, wnd->rto_ms);
+        char *retry = create_packet_buf(sock->established_local_addr.port,
+            sock->established_remote_addr.port, rseq, sock->ack_num,
+            DEFAULT_HEADER_LEN, DEFAULT_HEADER_LEN + rlen,
+            ACK_FLAG_MASK, refresh_advertised_window(sock), 0,
+            pending->data, rlen);
+        printf("[RDT][RETRANSMIT] seq=%u\n", rseq);
+        sendToLayer3(retry, DEFAULT_HEADER_LEN + rlen);
+        free(retry);
+        gettimeofday(&pending->send_time, NULL);
+        pending->retransmitted = 1;
+        start_rto_timer(wnd);
+        pthread_cond_broadcast(&(sock->wait_cond));
+    }
+    /* Unreachable: socket objects are retained by the protocol tables. */
+    return NULL;
+}
+
+static void enter_time_wait(tju_tcp_t *sock){
+    int old_state = sock->state;
+    sock->state = TIME_WAIT;
+    printf("[CLOSE][STATE] old=%s new=TIME_WAIT\n",
+           close_state_name(old_state));
+    printf("[CLOSE][TIME_WAIT_ENTER]\n");
+}
+
+static const char *close_state_name(int state){
+    switch (state) {
+    case ESTABLISHED: return "ESTABLISHED";
+    case FIN_WAIT_1: return "FIN_WAIT_1";
+    case FIN_WAIT_2: return "FIN_WAIT_2";
+    case CLOSE_WAIT: return "CLOSE_WAIT";
+    case CLOSING: return "CLOSING";
+    case LAST_ACK: return "LAST_ACK";
+    case TIME_WAIT: return "TIME_WAIT";
+    case CLOSED: return "CLOSED";
+    default: return "UNKNOWN";
+    }
+}
+
+/* Caller holds recv_lock (and tju_close also holds send_lock). */
+static void send_fin(tju_tcp_t *sock){
+    uint32_t seq = sock->window.wnd_send->snd_nxt;
+    send_segment_t *fin = calloc(1, sizeof(*fin));
+    if (fin == NULL) return;
+    fin->seq = seq;
+    fin->len = 1;                 /* FIN consumes one sequence number. */
+    fin->is_fin = 1;
+    fin->data = NULL;
+    gettimeofday(&fin->send_time, NULL);
+    if (sock->send_segments == NULL) sock->send_segments = fin;
+    else {
+        send_segment_t *tail = sock->send_segments;
+        while (tail->next) tail = tail->next;
+        tail->next = fin;
+    }
+    sock->fin_sent = 1;
+    sock->fin_seq = seq;
+    sock->window.wnd_send->snd_nxt = seq + 1;
+    char *pkt = create_packet_buf(sock->established_local_addr.port,
+        sock->established_remote_addr.port, seq, sock->ack_num,
+        DEFAULT_HEADER_LEN, DEFAULT_HEADER_LEN,
+        FIN_FLAG_MASK | ACK_FLAG_MASK, refresh_advertised_window(sock), 0,
+        NULL, 0);
+    printf("[CLOSE][FIN_TX] seq=%u\n", seq);
+    static int drop_fin_once = TEST_DROP_FIN;
+    if (drop_fin_once) {
+        printf("[CLOSE][TEST_DROP_FIN] seq=%u\n", seq);
+        drop_fin_once = 0;
+    } else {
+        sendToLayer3(pkt, DEFAULT_HEADER_LEN);
+    }
+    free(pkt);
+    if (!sock->window.wnd_send->timer_running)
+        start_rto_timer(sock->window.wnd_send);
+}
+
 static uint16_t refresh_advertised_window(tju_tcp_t *sock){
     receiver_window_t *rw = sock->window.wnd_recv;
+    uint16_t old_advertised = rw->advertised_wnd;
+    uint64_t old_edge = rw->advertised_right_edge;
     size_t occupied = (size_t)sock->received_len + rw->ooo_used;
     rw->used = occupied;
     size_t free_space = (rw->capacity > occupied) ? rw->capacity - occupied : 0;
-    rw->advertised_wnd = (free_space > UINT16_MAX) ? UINT16_MAX : (uint16_t)free_space;
+    /* OOO bytes already occupy sequence positions inside the advertised
+       range.  They consume memory, but must not reduce the sequence-space
+       range a second time: raw_free + ooo_used == capacity - received_len. */
+    size_t sequence_space_free = free_space + rw->ooo_used;
+    uint16_t desired_advertised = (sequence_space_free > UINT16_MAX) ?
+                                  UINT16_MAX : (uint16_t)sequence_space_free;
+    uint64_t safe_edge = (uint64_t)rw->rcv_nxt + sequence_space_free;
+    uint64_t desired_edge = (uint64_t)rw->rcv_nxt + desired_advertised;
+
+    if (old_edge == 0)
+        old_edge = (uint64_t)rw->rcv_nxt + old_advertised;
+    uint64_t new_edge = old_edge;
+    const char *reason = NULL;
+
+    /* SWS: expand the committed edge only by at least one MSS. */
+    if (desired_edge > new_edge) {
+        uint64_t growth = desired_edge - new_edge;
+        if (growth >= MAX_DLEN ||
+            (old_advertised == 0 && desired_advertised >= MAX_DLEN)) {
+            new_edge = desired_edge;
+            reason = old_advertised == 0 ? "zero_recovery" : "mss_threshold";
+        } else {
+            reason = "hold_mss";
+        }
+    }
+
+    /* This is only a defensive recovery for an already-invalid state.  With
+       the sequence-space accounting above, legal in-window OOO data leaves
+       safe_edge unchanged, so it cannot enter this branch. */
+    if (new_edge > safe_edge) {
+        new_edge = safe_edge;
+        reason = "buffer_constraint";
+    }
+    if (new_edge < rw->rcv_nxt)
+        new_edge = rw->rcv_nxt;
+    uint64_t advertised64 = new_edge - rw->rcv_nxt;
+    if (advertised64 > UINT16_MAX)
+        advertised64 = UINT16_MAX;
+    rw->advertised_wnd = (uint16_t)advertised64;
+    rw->advertised_right_edge = rw->rcv_nxt + advertised64;
+    if (reason == NULL && free_space > old_advertised &&
+        free_space - old_advertised < MAX_DLEN)
+        reason = "hold_mss";
+    if (reason != NULL) {
+        RDT_VERBOSE("[FLOW][SWS_RX] free=%zu old_adv=%u new_adv=%u reason=%s\n",
+               free_space, old_advertised, rw->advertised_wnd, reason);
+    }
+    /* Keep an audit trace even when an OOO segment leaves the edge unchanged. */
+    RDT_VERBOSE("[FLOW][RIGHT_EDGE] rcv_nxt=%u old_edge=%llu new_edge=%llu\n",
+           rw->rcv_nxt,
+           (unsigned long long)old_edge,
+           (unsigned long long)rw->advertised_right_edge);
     return rw->advertised_wnd;
 }
 
@@ -533,10 +739,11 @@ static void tx_ack(tju_tcp_t *sock){
     size_t free_space = sock->window.wnd_recv->capacity > occupied ?
         sock->window.wnd_recv->capacity - occupied : 0;
     char *ack_pkt = create_packet_buf(sock->established_local_addr.port,
-        sock->established_remote_addr.port, sock->seq_num, sock->ack_num,
+        sock->established_remote_addr.port,
+        sock->window.wnd_send->snd_nxt, sock->ack_num,
         DEFAULT_HEADER_LEN, DEFAULT_HEADER_LEN, ACK_FLAG_MASK, advertised, 0, NULL, 0);
-    printf("[RDT][ACK_TX] ack=%u\n", sock->ack_num);
-    printf("[FLOW][RWND_TX] free=%zu advertised=%u\n",
+    RDT_VERBOSE("[RDT][ACK_TX] ack=%u\n", sock->ack_num);
+    RDT_VERBOSE("[FLOW][RWND_TX] free=%zu advertised=%u\n",
            free_space,
            advertised);
     sendToLayer3(ack_pkt, DEFAULT_HEADER_LEN);
@@ -556,13 +763,13 @@ static void tx_probe_ack(tju_tcp_t *sock){
     char *ack_pkt = create_packet_buf(
         sock->established_local_addr.port,
         sock->established_remote_addr.port,
-        sock->seq_num, sock->ack_num,
+        sock->window.wnd_send->snd_nxt, sock->ack_num,
         DEFAULT_HEADER_LEN, DEFAULT_HEADER_LEN,
         ACK_FLAG_MASK, advertised, 0, NULL, 0);
     printf("[FLOW][ZERO_PROBE_ACK] ack=%u rwnd=%u\n",
            sock->ack_num, advertised);
-    printf("[RDT][ACK_TX] ack=%u\n", sock->ack_num);
-    printf("[FLOW][RWND_TX] free=%zu advertised=%u\n",
+    RDT_VERBOSE("[RDT][ACK_TX] ack=%u\n", sock->ack_num);
+    RDT_VERBOSE("[FLOW][RWND_TX] free=%zu advertised=%u\n",
            free_space, advertised);
     sendToLayer3(ack_pkt, DEFAULT_HEADER_LEN);
     free(ack_pkt);
@@ -800,7 +1007,7 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
         uint16_t rwnd = get_advertised_window(pkt);
         pthread_mutex_lock(&(sock->recv_lock));
         sock->window.wnd_send->peer_wnd = rwnd;
-        printf("[FLOW][RWND_RX] rwnd=%u\n", rwnd);
+        RDT_VERBOSE("[FLOW][RWND_RX] rwnd=%u\n", rwnd);
         if (rwnd == 0)
             printf("[FLOW][ZERO_WINDOW_RX]\n");
         else if (sock->window.wnd_send->persist_active) {
@@ -809,6 +1016,7 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
             sock->window.wnd_send->persist_interval_ms = 0;
         }
         pthread_cond_broadcast(&(sock->wait_cond));
+        pthread_cond_signal(&(sock->rto_cond));
         pthread_mutex_unlock(&(sock->recv_lock));
     }
 
@@ -827,10 +1035,20 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
         return 0;
     }
 
-    if (sock->state == ESTABLISHED && (flags & ACK_FLAG_MASK)) {
+    if ((sock->state == ESTABLISHED || sock->state == FIN_WAIT_1 ||
+         sock->state == FIN_WAIT_2 || sock->state == CLOSING ||
+         sock->state == LAST_ACK) && (flags & ACK_FLAG_MASK)) {
         uint32_t ack = get_ack(pkt);
         pthread_mutex_lock(&(sock->recv_lock));
-        if (ack > sock->window.wnd_send->snd_una) {
+        sender_window_t *stats_wnd = sock->window.wnd_send;
+        stats_wnd->total_ack_packets++;
+        /* ACKs beyond snd_nxt acknowledge data we never sent.  Treat them as
+           invalid/stale for recovery purposes; in particular they must not
+           advance snd_una or perturb duplicate-ACK accounting. */
+        if (ack > sock->window.wnd_send->snd_nxt) {
+            stats_wnd->stale_acks++;
+        } else if (ack > sock->window.wnd_send->snd_una) {
+            stats_wnd->advancing_acks++;
             uint32_t confirmed = ack - sock->window.wnd_send->snd_una;
             struct timeval now;
             gettimeofday(&now, NULL);
@@ -841,7 +1059,7 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
                 sample = sample->next;
             }
             if (karn_ambiguous) {
-                printf("[RDT][KARN_SKIP_ACK] ack=%u\n", ack);
+                RDT_VERBOSE("[RDT][KARN_SKIP_ACK] ack=%u\n", ack);
             } else {
                 sample = sock->send_segments;
                 /* One ACK event contributes at most one RTT sample. */
@@ -849,7 +1067,7 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
                     long rtt = (now.tv_sec - sample->send_time.tv_sec) * 1000L +
                         (now.tv_usec - sample->send_time.tv_usec) / 1000L;
                     if (rtt < 1) rtt = 1;
-                    printf("[RDT][RTT_SAMPLE] seq=%u rtt_ms=%ld\n", sample->seq, rtt);
+                    RDT_VERBOSE("[RDT][RTT_SAMPLE] seq=%u rtt_ms=%ld\n", sample->seq, rtt);
                     if (!sock->window.wnd_send->has_rtt_sample) {
                         sock->window.wnd_send->srtt_ms = rtt;
                         sock->window.wnd_send->rttvar_ms = rtt / 2;
@@ -872,7 +1090,7 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
                     if (bounded_rto > RTO_MAX_MS)
                         bounded_rto = RTO_MAX_MS;
                     sock->window.wnd_send->rto_ms = (uint32_t)bounded_rto;
-                    printf("[RDT][RTT_UPDATE] srtt_ms=%u rttvar_ms=%u raw_rto_ms=%llu rto_ms=%u\n",
+                    RDT_VERBOSE("[RDT][RTT_UPDATE] srtt_ms=%u rttvar_ms=%u raw_rto_ms=%llu rto_ms=%u\n",
                            sock->window.wnd_send->srtt_ms,
                            sock->window.wnd_send->rttvar_ms,
                            (unsigned long long)raw_rto,
@@ -880,9 +1098,11 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
                 }
             }
             sock->window.wnd_send->snd_una = ack;
+            int fin_just_acked = 0;
             while (sock->send_segments != NULL &&
                    sock->send_segments->seq + sock->send_segments->len <= ack) {
                 send_segment_t *done = sock->send_segments;
+                if (done->is_fin) fin_just_acked = 1;
                 sock->send_segments = done->next;
                 free(done->data);
                 free(done);
@@ -897,34 +1117,89 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
                 sock->sending_len -= confirmed;
                 sock->sending_buf = realloc(sock->sending_buf, sock->sending_len);
             }
-            printf("[RDT][ACK_RX] ack=%u snd_una=%u\n", ack,
+            RDT_VERBOSE("[RDT][ACK_RX] ack=%u snd_una=%u\n", ack,
                    sock->window.wnd_send->snd_una);
             sock->window.wnd_send->last_ack = ack;
             sock->window.wnd_send->dup_ack_count = 0;
             sock->window.wnd_send->fast_retransmit_done = 0;
+            /* Bounded partial-ACK recovery: after a 3-duplicate-ACK
+               retransmission, one advancing ACK that still falls inside
+               the original flight may reveal a second hole.  Repair at
+               most one such next-oldest segment per recovery epoch.  The
+               bound prevents speculative retransmissions from feeding back
+               into a duplicate-ACK storm. */
+            if (sock->window.wnd_send->recovery_active) {
+                if (sock->window.wnd_send->snd_una >=
+                    sock->window.wnd_send->recovery_end_seq) {
+                    sock->window.wnd_send->recovery_active = 0;
+                } else if (!sock->window.wnd_send->recovery_retransmitted &&
+                           sock->send_segments != NULL &&
+                           !sock->send_segments->is_fin) {
+                    send_segment_t *partial = sock->send_segments;
+                    char *retry = create_packet_buf(
+                        sock->established_local_addr.port,
+                        sock->established_remote_addr.port,
+                        partial->seq, sock->ack_num,
+                        DEFAULT_HEADER_LEN,
+                        DEFAULT_HEADER_LEN + partial->len,
+                        ACK_FLAG_MASK,
+                        refresh_advertised_window(sock), 0,
+                        partial->data, partial->len);
+                    printf("[RDT][FAST_RETRANSMIT] seq=%u len=%u\n",
+                           partial->seq, partial->len);
+                    sendToLayer3(retry,
+                                 DEFAULT_HEADER_LEN + partial->len);
+                    free(retry);
+                    partial->retransmitted = 1;
+                    gettimeofday(&partial->send_time, NULL);
+                    start_rto_timer(sock->window.wnd_send);
+                    sock->window.wnd_send->recovery_retransmitted = 1;
+                }
+            }
             if (sock->send_segments != NULL) {
                 start_rto_timer(sock->window.wnd_send);
-                printf("[RDT][RTO_TIMER_RESTART] ack=%u rto_ms=%u\n",
+                RDT_VERBOSE("[RDT][RTO_TIMER_RESTART] ack=%u rto_ms=%u\n",
                        ack, sock->window.wnd_send->rto_ms);
             } else {
                 sock->window.wnd_send->timer_running = 0;
             }
+            if (fin_just_acked) {
+                sock->fin_acked = 1;
+                printf("[CLOSE][FIN_ACKED] ack=%u\n", ack);
+                if (sock->state == LAST_ACK) {
+                    sock->state = CLOSED;
+                    printf("[CLOSE][STATE] old=LAST_ACK new=CLOSED\n");
+                } else if (sock->state == FIN_WAIT_1) {
+                    if (sock->fin_received) enter_time_wait(sock);
+                    else {
+                        printf("[CLOSE][STATE] old=FIN_WAIT_1 new=FIN_WAIT_2\n");
+                        sock->state = FIN_WAIT_2;
+                    }
+                } else if (sock->state == CLOSING) {
+                    enter_time_wait(sock);
+                }
+            }
             pthread_cond_broadcast(&(sock->wait_cond));
+            pthread_cond_signal(&(sock->rto_cond));
+        } else if (ack < sock->window.wnd_send->snd_una) {
+            stats_wnd->stale_acks++;
         } else if (ack == sock->window.wnd_send->snd_una &&
                    sock->send_segments != NULL) {
             sender_window_t *wnd = sock->window.wnd_send;
+            wnd->duplicate_acks++;
             if (wnd->last_ack == ack)
                 wnd->dup_ack_count++;
             else {
                 wnd->last_ack = ack;
                 wnd->dup_ack_count = 1;
             }
-            printf("[RDT][DUP_ACK] ack=%u count=%u\n", ack,
+            RDT_VERBOSE("[RDT][DUP_ACK] ack=%u count=%u\n", ack,
                    wnd->dup_ack_count);
             if (wnd->dup_ack_count >= 3 && !wnd->fast_retransmit_done) {
                 send_segment_t *seg = sock->send_segments;
                 printf("[RDT][FAST_RETRANSMIT] seq=%u len=%u\n",
                        seg->seq, seg->len);
+                wnd->fast_retransmits++;
                 char *retry = create_packet_buf(
                     sock->established_local_addr.port,
                     sock->established_remote_addr.port,
@@ -935,10 +1210,66 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
                 free(retry);
                 seg->retransmitted = 1;
                 gettimeofday(&seg->send_time, NULL);
+                /* Fast retransmit restarts the single oldest-unacked timer
+                   from the retransmission.  Without this reset, the
+                   original deadline can expire immediately afterwards and
+                   cause a redundant RTO retransmission of the same segment,
+                   needlessly extending loss recovery. */
+                start_rto_timer(wnd);
+                pthread_cond_signal(&(sock->rto_cond));
+                wnd->recovery_active = 1;
+                wnd->recovery_retransmitted = 0;
+                wnd->recovery_end_seq = wnd->snd_nxt;
                 wnd->fast_retransmit_done = 1;
             }
         }
+        if ((stats_wnd->total_ack_packets % 10000) == 0) {
+            printf("[RDT][ACK_STATS] total=%llu advancing=%llu dup=%llu stale=%llu fast=%llu\n",
+                   (unsigned long long)stats_wnd->total_ack_packets,
+                   (unsigned long long)stats_wnd->advancing_acks,
+                   (unsigned long long)stats_wnd->duplicate_acks,
+                   (unsigned long long)stats_wnd->stale_acks,
+                   (unsigned long long)stats_wnd->fast_retransmits);
+        }
         pthread_mutex_unlock(&(sock->recv_lock));
+    }
+
+    /* FIN consumes one sequence number and is processed before the payload
+       path, including for simultaneous close and duplicate FINs. */
+    if ((flags & FIN_FLAG_MASK) && sock->state != LISTEN &&
+        sock->state != SYN_SENT && sock->state != SYN_RECV) {
+        pthread_mutex_lock(&(sock->recv_lock));
+        uint32_t fin_seq = get_seq(pkt);
+        uint32_t expected_fin = sock->window.wnd_recv->rcv_nxt;
+        printf("[CLOSE][FIN_RX] seq=%u\n", fin_seq);
+        if (fin_seq == expected_fin) {
+            sock->window.wnd_recv->rcv_nxt = expected_fin + 1;
+            sock->ack_num = expected_fin + 1;
+            if (!sock->fin_received) sock->fin_received = 1;
+            tx_ack(sock);
+            if (sock->state == ESTABLISHED) {
+                printf("[CLOSE][STATE] old=ESTABLISHED new=CLOSE_WAIT\n");
+                sock->state = CLOSE_WAIT;
+            } else if (sock->state == FIN_WAIT_1) {
+                sock->fin_received = 1;
+                if (sock->fin_acked) enter_time_wait(sock);
+                else {
+                    printf("[CLOSE][STATE] old=FIN_WAIT_1 new=CLOSING\n");
+                    sock->state = CLOSING;
+                }
+            } else if (sock->state == FIN_WAIT_2) {
+                enter_time_wait(sock);
+            } else if (sock->state == TIME_WAIT) {
+                /* remain in TIME_WAIT; ACK was retransmitted above */
+            }
+            pthread_cond_broadcast(&(sock->wait_cond));
+        } else if (fin_seq < expected_fin || sock->state == TIME_WAIT) {
+            sock->ack_num = expected_fin;
+            tx_ack(sock);
+        }
+        pthread_mutex_unlock(&(sock->recv_lock));
+        if (get_plen(pkt) == DEFAULT_HEADER_LEN)
+            return 0;
     }
 
     uint16_t plen = get_plen(pkt);
@@ -949,6 +1280,22 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
     if(data_len <= 0)
         return 0;
     pthread_mutex_lock(&(sock->recv_lock));
+    uint32_t packet_seq = get_seq(pkt);
+    uint32_t expected = sock->window.wnd_recv->rcv_nxt;
+    uint64_t packet_end = (uint64_t)packet_seq + data_len;
+    /* Do not accept new sequence space beyond the committed right edge.
+       Duplicate bytes below rcv_nxt are still ACKed without consuming space. */
+    if (packet_seq >= expected &&
+        packet_end > sock->window.wnd_recv->advertised_right_edge) {
+        RDT_VERBOSE("[RDT][OUT_OF_WINDOW] seq=%u end=%llu right_edge=%llu\n",
+               packet_seq,
+               (unsigned long long)packet_end,
+               (unsigned long long)sock->window.wnd_recv->advertised_right_edge);
+        sock->ack_num = expected;
+        tx_ack(sock);
+        pthread_mutex_unlock(&(sock->recv_lock));
+        return 0;
+    }
     size_t occupied = (size_t)sock->received_len + sock->window.wnd_recv->ooo_used;
     if (occupied >= sock->window.wnd_recv->capacity ||
         (size_t)data_len > sock->window.wnd_recv->capacity - occupied) {
@@ -957,14 +1304,12 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
         pthread_mutex_unlock(&(sock->recv_lock));
         return 0;
     }
-    uint32_t packet_seq = get_seq(pkt);
-    uint32_t expected = sock->window.wnd_recv->rcv_nxt;
     if (packet_seq < expected) {
-        printf("[RDT][DUPLICATE] seq=%u expected=%u\n", packet_seq, expected);
+        RDT_VERBOSE("[RDT][DUPLICATE] seq=%u expected=%u\n", packet_seq, expected);
         sock->ack_num = expected;
         tx_ack(sock);
     } else if (packet_seq > expected) {
-        printf("[RDT][OUT_OF_ORDER] seq=%u expected=%u\n", packet_seq, expected);
+        RDT_VERBOSE("[RDT][OUT_OF_ORDER] seq=%u expected=%u\n", packet_seq, expected);
         recv_segment_t *cur = sock->window.wnd_recv->ooo_head;
         int duplicate = 0;
         while (cur) { if (cur->seq == packet_seq) duplicate = 1; cur = cur->next; }
@@ -986,7 +1331,7 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
     } else {
         append_received(sock, pkt + DEFAULT_HEADER_LEN, data_len);
         expected += data_len;
-        printf("[RDT][IN_ORDER] seq=%u len=%u rcv_nxt=%u\n", packet_seq, data_len, expected);
+        RDT_VERBOSE("[RDT][IN_ORDER] seq=%u len=%u rcv_nxt=%u\n", packet_seq, data_len, expected);
         /* The list is sorted; repeatedly consume its head while it directly
            follows rcv_nxt.  This handles any number of cached segments. */
         while (sock->window.wnd_recv->ooo_head != NULL &&
@@ -1033,5 +1378,78 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
 // }
 
 int tju_close (tju_tcp_t* sock){
+    if (sock == NULL) return -1;
+    pthread_mutex_lock(&(sock->send_lock));
+    pthread_mutex_lock(&(sock->recv_lock));
+    /* Never close ahead of data submitted by the application. */
+    while (sock->send_segments != NULL && sock->state != CLOSED)
+        pthread_cond_wait(&(sock->wait_cond), &(sock->recv_lock));
+    if (sock->state == CLOSED) {
+        pthread_mutex_unlock(&(sock->recv_lock));
+        pthread_mutex_unlock(&(sock->send_lock));
+        return 0;
+    }
+    int old_state = sock->state;
+    if (old_state == ESTABLISHED) {
+        sock->state = FIN_WAIT_1;
+        printf("[CLOSE][STATE] old=ESTABLISHED new=FIN_WAIT_1\n");
+        send_fin(sock);
+    } else if (old_state == CLOSE_WAIT) {
+        sock->state = LAST_ACK;
+        printf("[CLOSE][STATE] old=CLOSE_WAIT new=LAST_ACK\n");
+        send_fin(sock);
+    } else {
+        pthread_mutex_unlock(&(sock->recv_lock));
+        pthread_mutex_unlock(&(sock->send_lock));
+        return 0;
+    }
+
+    while (sock->state != CLOSED && sock->state != TIME_WAIT) {
+        sender_window_t *wnd = sock->window.wnd_send;
+        /* In FIN_WAIT_2 our FIN is already acknowledged.  The half-closed
+           endpoint must remain alive and keep receiving DATA until peer FIN. */
+        if (sock->state == FIN_WAIT_2) {
+            pthread_cond_wait(&(sock->wait_cond), &(sock->recv_lock));
+            continue;
+        }
+        if (sock->send_segments == NULL) {
+            pthread_cond_wait(&(sock->wait_cond), &(sock->recv_lock));
+            continue;
+        }
+        int rc = pthread_cond_timedwait(&(sock->wait_cond),
+                                        &(sock->recv_lock),
+                                        &wnd->rto_deadline);
+        if (rc == ETIMEDOUT && sock->send_segments != NULL) {
+            send_segment_t *fin = sock->send_segments;
+            if (!fin->is_fin) continue;
+            char *pkt = create_packet_buf(sock->established_local_addr.port,
+                sock->established_remote_addr.port, fin->seq, sock->ack_num,
+                DEFAULT_HEADER_LEN, DEFAULT_HEADER_LEN,
+                FIN_FLAG_MASK | ACK_FLAG_MASK,
+                refresh_advertised_window(sock), 0, NULL, 0);
+            printf("[CLOSE][FIN_RETRANSMIT] seq=%u\n", fin->seq);
+            sendToLayer3(pkt, DEFAULT_HEADER_LEN);
+            free(pkt);
+            fin->retransmitted = 1;
+            gettimeofday(&fin->send_time, NULL);
+            uint64_t next = (uint64_t)wnd->rto_ms * 2;
+            wnd->rto_ms = next > RTO_MAX_MS ? RTO_MAX_MS : (uint32_t)next;
+            start_rto_timer(wnd);
+        }
+    }
+    if (sock->state == TIME_WAIT) {
+        struct timespec delay;
+        delay.tv_sec = (2 * TIME_WAIT_MSL_MS) / 1000;
+        delay.tv_nsec = (long)((2 * TIME_WAIT_MSL_MS) % 1000) * 1000000L;
+        pthread_mutex_unlock(&(sock->recv_lock));
+        nanosleep(&delay, NULL);
+        pthread_mutex_lock(&(sock->recv_lock));
+        printf("[CLOSE][TIME_WAIT_EXIT]\n");
+        sock->state = CLOSED;
+        sock->window.wnd_send->timer_running = 0;
+        pthread_cond_signal(&(sock->rto_cond));
+    }
+    pthread_mutex_unlock(&(sock->recv_lock));
+    pthread_mutex_unlock(&(sock->send_lock));
     return 0;
 }

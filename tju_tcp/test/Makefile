@@ -9,10 +9,12 @@ OBJS = $(BUILD_DIR)/tju_packet.o \
 
 default:all
 
+.PHONY: cc
+
 all: clean test_client test_server rdt_server rdt_client close_client
 
 clean:
-	-rm -f test_client test_server rdt_server rdt_client close_client client.log server.log rdt_server.log rdt_client.log rdt_recv_file.txt
+	-rm -f test_client test_server rdt_server rdt_client close_client cc_server cc_client client.log server.log rdt_server.log rdt_client.log rdt_recv_file.txt
 
 test_client:
 	gcc -pthread -g -ggdb -DDEBUG -I../inc ./test_client.c -o test_client $(OBJS)
@@ -27,3 +29,11 @@ rdt_client:
 
 close_client:
 	gcc -pthread -g -ggdb -DDEBUG -I../inc ./test_close_client.c -o close_client $(OBJS)
+
+cc: cc_server cc_client
+
+cc_server:
+	gcc -pthread -g -ggdb -DDEBUG -I../inc ./test_cc_server.c -o cc_server $(OBJS)
+
+cc_client:
+	gcc -pthread -g -ggdb -DDEBUG -I../inc ./test_cc_client.c -o cc_client $(OBJS)

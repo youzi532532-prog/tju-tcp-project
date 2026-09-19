@@ -5,8 +5,19 @@
 #include "tju_packet.h"
 #include "kernel.h"
 
-#define SERVER_IP "172.17.0.6"
-#define CLIENT_IP "172.17.0.5"
+#define SERVER_IP "172.17.0.3"
+#define CLIENT_IP "172.17.0.2"
+
+/* Stage-3 Reno state is kept outside global.h because global.h is a
+   course-restricted interface.  All window values use payload bytes. */
+typedef struct tju_reno_state {
+    sender_window_t *sender;
+    uint32_t cwnd;
+    uint32_t ssthresh;
+    uint64_t ca_acked_bytes;
+    int congestion_state;
+    struct tju_reno_state *next;
+} tju_reno_state_t;
 
 /*
 创建 TCP socket 

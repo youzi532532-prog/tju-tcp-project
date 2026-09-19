@@ -13,6 +13,172 @@ static void enter_time_wait(tju_tcp_t *sock);
 static const char *close_state_name(int state);
 static void *data_rto_worker(void *arg);
 static void start_data_rto_worker(tju_tcp_t *sock);
+static uint32_t initial_congestion_window(uint32_t smss);
+static uint32_t effective_send_window(const sender_window_t *wnd);
+static tju_reno_state_t *reno_register(sender_window_t *wnd);
+static tju_reno_state_t *reno_state_for(const sender_window_t *wnd);
+static void reno_trace(const char *event, const sender_window_t *wnd,
+                       uint32_t seq, uint32_t ack, uint32_t flight);
+static void congestion_on_ack(sender_window_t *wnd, uint32_t acked_bytes,
+                              uint32_t seq, uint32_t ack, uint32_t flight);
+static void congestion_on_loss(sender_window_t *wnd, uint32_t seq,
+                               uint32_t ack, uint32_t flight, int timeout);
+
+/* The wire header is 20 bytes, so the course-defined SMSS is 1380 bytes.
+   Keep this local instead of changing the restricted global length constants. */
+#define TJU_SMSS ((uint32_t)(MAX_LEN - DEFAULT_HEADER_LEN))
+
+static tju_reno_state_t *reno_states = NULL;
+static pthread_mutex_t reno_states_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t reno_trace_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *reno_trace_file = NULL;
+static int reno_trace_initialized = 0;
+
+/* RFC 5681 section 3.1 compatible initial window:
+   min(4*SMSS, max(2*SMSS, 4380 bytes)). */
+static uint32_t initial_congestion_window(uint32_t smss){
+    uint32_t lower = 2 * smss;
+    uint32_t candidate = lower > 4380U ? lower : 4380U;
+    uint32_t upper = 4 * smss;
+    return candidate < upper ? candidate : upper;
+}
+
+static tju_reno_state_t *reno_register(sender_window_t *wnd){
+    tju_reno_state_t *state = calloc(1, sizeof(*state));
+    if (state == NULL) return NULL;
+    state->sender = wnd;
+    state->cwnd = initial_congestion_window(wnd->mss);
+    state->ssthresh = UINT16_MAX;
+    state->congestion_state = SLOW_START;
+    pthread_mutex_lock(&reno_states_lock);
+    state->next = reno_states;
+    reno_states = state;
+    pthread_mutex_unlock(&reno_states_lock);
+    return state;
+}
+
+static tju_reno_state_t *reno_state_for(const sender_window_t *wnd){
+    pthread_mutex_lock(&reno_states_lock);
+    tju_reno_state_t *state = reno_states;
+    while (state != NULL && state->sender != wnd) state = state->next;
+    pthread_mutex_unlock(&reno_states_lock);
+    return state;
+}
+
+static uint32_t effective_send_window(const sender_window_t *wnd){
+    tju_reno_state_t *state = reno_state_for(wnd);
+    if (state == NULL) return 0;
+    return state->cwnd < (uint32_t)wnd->peer_wnd ?
+        state->cwnd : (uint32_t)wnd->peer_wnd;
+}
+
+static const char *congestion_state_name(int state){
+    return state == SLOW_START ? "slow_start" : "congestion_avoidance";
+}
+
+/* CSV trace is enabled by default.  Set TJU_CC_TRACE=0 to disable it, or
+   TJU_CC_TRACE_FILE to choose an explicit output path. */
+static void reno_trace(const char *event, const sender_window_t *wnd,
+                       uint32_t seq, uint32_t ack, uint32_t flight){
+    tju_reno_state_t *state = reno_state_for(wnd);
+    if (state == NULL) return;
+
+    pthread_mutex_lock(&reno_trace_lock);
+    if (!reno_trace_initialized) {
+        reno_trace_initialized = 1;
+        const char *enabled = getenv("TJU_CC_TRACE");
+        if (enabled == NULL || strcmp(enabled, "0") != 0) {
+            const char *configured = getenv("TJU_CC_TRACE_FILE");
+            char default_path[128];
+            if (configured == NULL || configured[0] == '\0') {
+                char hostname[64] = "host";
+                gethostname(hostname, sizeof(hostname) - 1);
+                snprintf(default_path, sizeof(default_path),
+                         "tju_tcp_cc_%s_%ld.csv", hostname, (long)getpid());
+                configured = default_path;
+            }
+            reno_trace_file = fopen(configured, "w");
+            if (reno_trace_file != NULL) {
+                fprintf(reno_trace_file,
+                        "timestamp_us,event,seq,ack,cwnd,ssthresh,rwnd,"
+                        "flight_size,state,allowed,smss\n");
+            } else {
+                fprintf(stderr, "TJU_TCP: cannot open Reno trace '%s': %s\n",
+                        configured, strerror(errno));
+            }
+        }
+    }
+    if (reno_trace_file == NULL) {
+        pthread_mutex_unlock(&reno_trace_lock);
+        return;
+    }
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    unsigned long long time_us =
+        (unsigned long long)now.tv_sec * 1000000ULL +
+        (unsigned long long)now.tv_nsec / 1000ULL;
+    fprintf(reno_trace_file, "%llu,%s,%u,%u,%u,%u,%u,%u,%s,%u,%u\n",
+            time_us, event, seq, ack, state->cwnd, state->ssthresh,
+            wnd->peer_wnd, flight,
+            congestion_state_name(state->congestion_state),
+            effective_send_window(wnd), wnd->mss);
+    if (strcmp(event, "RTO") == 0 || strcmp(event, "FAST_RETRANSMIT") == 0)
+        fflush(reno_trace_file);
+    pthread_mutex_unlock(&reno_trace_lock);
+}
+
+static void congestion_on_ack(sender_window_t *wnd, uint32_t acked_bytes,
+                              uint32_t seq, uint32_t ack, uint32_t flight){
+    if (acked_bytes == 0) return;
+    tju_reno_state_t *state = reno_state_for(wnd);
+    if (state == NULL) return;
+
+    if (state->congestion_state == SLOW_START) {
+        uint32_t increase = acked_bytes < wnd->mss ? acked_bytes : wnd->mss;
+        if (UINT32_MAX - state->cwnd < increase)
+            state->cwnd = UINT32_MAX;
+        else
+            state->cwnd += increase;
+        if (state->cwnd >= state->ssthresh) {
+            state->congestion_state = CONGESTION_AVOIDANCE;
+            state->ca_acked_bytes = 0;
+        }
+    } else {
+        /* Appropriate byte counting: one SMSS for roughly one cwnd of newly
+           acknowledged bytes, hence approximately one SMSS per RTT. */
+        state->ca_acked_bytes += acked_bytes;
+        while (state->ca_acked_bytes >= state->cwnd &&
+               state->cwnd != UINT32_MAX) {
+            uint32_t old_cwnd = state->cwnd;
+            state->ca_acked_bytes -= old_cwnd;
+            if (UINT32_MAX - state->cwnd < wnd->mss)
+                state->cwnd = UINT32_MAX;
+            else
+                state->cwnd += wnd->mss;
+        }
+    }
+    reno_trace("ACK", wnd, seq, ack, flight);
+}
+
+static void congestion_on_loss(sender_window_t *wnd, uint32_t seq,
+                               uint32_t ack, uint32_t flight, int timeout){
+    tju_reno_state_t *state = reno_state_for(wnd);
+    if (state == NULL) return;
+    uint32_t half_flight = flight / 2;
+    uint32_t minimum = 2 * (uint32_t)wnd->mss;
+    state->ssthresh = half_flight > minimum ? half_flight : minimum;
+    state->ca_acked_bytes = 0;
+    if (timeout) {
+        state->cwnd = wnd->mss;
+        state->congestion_state = SLOW_START;
+        reno_trace("RTO", wnd, seq, ack, flight);
+    } else {
+        /* Full fast recovery is optional in stage 3.  Basic Reno performs
+           fast retransmit, reduces cwnd, and continues in avoidance. */
+        state->cwnd = state->ssthresh;
+        state->congestion_state = CONGESTION_AVOIDANCE;
+    }
+}
 
 /*
 创建 TCP socket 
@@ -48,9 +214,13 @@ tju_tcp_t* tju_socket(){
     sock->window.wnd_send = calloc(1, sizeof(sender_window_t));
     sock->window.wnd_recv = calloc(1, sizeof(receiver_window_t));
     sock->window.wnd_send->window_size = 4;
-    sock->window.wnd_send->buffer_capacity = SEND_BUFFER_CAPACITY;
-    sock->window.wnd_send->mss = MAX_DLEN;
+    sock->window.wnd_send->mss = TJU_SMSS;
+    sock->window.wnd_send->buffer_capacity = (size_t)5000 * TJU_SMSS;
     sock->window.wnd_send->peer_wnd = UINT16_MAX;
+    if (reno_register(sock->window.wnd_send) == NULL) {
+        perror("ERROR Reno state not allocated");
+        exit(-1);
+    }
     sock->window.wnd_send->rto_ms = RTO_MIN_MS;
     sock->window.wnd_send->timer_running = 0;
     sock->window.wnd_send->has_rtt_sample = 0;
@@ -62,7 +232,7 @@ tju_tcp_t* tju_socket(){
     sock->window.wnd_send->recovery_end_seq = 0;
     sock->window.wnd_send->persist_active = 0;
     sock->window.wnd_send->persist_interval_ms = 0;
-    sock->window.wnd_recv->capacity = RECV_BUFFER_CAPACITY;
+    sock->window.wnd_recv->capacity = (size_t)5000 * TJU_SMSS;
     sock->window.wnd_recv->used = 0;
     sock->window.wnd_recv->ooo_used = 0;
     sock->window.wnd_recv->advertised_wnd = UINT16_MAX;
@@ -75,6 +245,8 @@ tju_tcp_t* tju_socket(){
     sock->fin_received = 0;
     sock->fin_acked = 0;
     sock->fin_seq = 0;
+
+    reno_trace("INIT", sock->window.wnd_send, 0, 0, 0);
 
     return sock;
 }
@@ -282,18 +454,21 @@ int tju_send(tju_tcp_t* sock, const void *buffer, int len){
     int offset = 0;
     while (offset < len) {
         int segment_len = len - offset;
-        if (segment_len > MAX_DLEN) segment_len = MAX_DLEN;
+        if ((uint32_t)segment_len > sock->window.wnd_send->mss)
+            segment_len = (int)sock->window.wnd_send->mss;
         pthread_mutex_lock(&(sock->recv_lock));
         uint32_t flight = sock->window.wnd_send->snd_nxt - sock->window.wnd_send->snd_una;
         if (sock->window.wnd_send->peer_wnd == 0)
             RDT_VERBOSE("[FLOW][SEND_BLOCK_ZERO_WINDOW]\n");
         for (;;) {
-            uint32_t available = sock->window.wnd_send->peer_wnd > flight ?
-                sock->window.wnd_send->peer_wnd - flight : 0;
-            int final_segment = (segment_len < MAX_DLEN && flight == 0);
-            int full_mss_available = (available >= MAX_DLEN);
+            uint32_t send_window = effective_send_window(sock->window.wnd_send);
+            uint32_t available = send_window > flight ? send_window - flight : 0;
+            int final_segment = ((uint32_t)segment_len < sock->window.wnd_send->mss &&
+                                 flight == 0);
+            int full_mss_available =
+                (available >= sock->window.wnd_send->mss);
             int window_too_small = ((uint64_t)flight + (uint32_t)segment_len >
-                                   sock->window.wnd_send->peer_wnd);
+                                   send_window);
 
             /* Sender-side SWS avoidance applies only to new application
                data.  A short final write is allowed when no data is in
@@ -312,10 +487,6 @@ int tju_send(tju_tcp_t* sock, const void *buffer, int len){
             }
             if (sock->window.wnd_send->peer_wnd == 0)
                 RDT_VERBOSE("[FLOW][SEND_BLOCK_ZERO_WINDOW]\n");
-            RDT_VERBOSE("[FLOW][SEND_WINDOW] flight=%u rwnd=%u allowed=%u\n",
-                   flight, sock->window.wnd_send->peer_wnd,
-                   (sock->window.wnd_send->peer_wnd > flight) ?
-                   sock->window.wnd_send->peer_wnd - flight : 0);
             if (sock->window.wnd_send->peer_wnd == 0) {
                 sender_window_t *wnd = sock->window.wnd_send;
                 if (!wnd->persist_active) {
@@ -364,10 +535,6 @@ int tju_send(tju_tcp_t* sock, const void *buffer, int len){
             }
             flight = sock->window.wnd_send->snd_nxt - sock->window.wnd_send->snd_una;
         }
-        RDT_VERBOSE("[FLOW][SEND_WINDOW] flight=%u rwnd=%u allowed=%u\n",
-               flight, sock->window.wnd_send->peer_wnd,
-               (sock->window.wnd_send->peer_wnd > flight) ?
-               sock->window.wnd_send->peer_wnd - flight : 0);
         RDT_VERBOSE("[RDT][WINDOW] snd_una=%u snd_nxt=%u window_size=%u flight_size=%u\n",
                sock->window.wnd_send->snd_una, sock->window.wnd_send->snd_nxt,
                sock->window.wnd_send->window_size,
@@ -430,6 +597,9 @@ int tju_send(tju_tcp_t* sock, const void *buffer, int len){
                sock->window.wnd_send->snd_una, sock->window.wnd_send->snd_nxt,
                sock->window.wnd_send->window_size,
                sock->window.wnd_send->snd_nxt - sock->window.wnd_send->snd_una);
+        reno_trace("SEND", sock->window.wnd_send, seq, sock->ack_num,
+                   sock->window.wnd_send->snd_nxt -
+                   sock->window.wnd_send->snd_una);
         pthread_mutex_unlock(&(sock->recv_lock));
         /* segment_len is the only payload length used on the wire. */
         uint16_t plen = DEFAULT_HEADER_LEN + (uint16_t)segment_len;
@@ -501,10 +671,12 @@ int tju_recv(tju_tcp_t* sock, void *buffer, int len){
     }
     size_t old_window = sock->window.wnd_recv->advertised_wnd;
     refresh_advertised_window(sock);
-    if (old_window == 0 && sock->window.wnd_recv->advertised_wnd > 0)
-        printf("[FLOW][WINDOW_UPDATE] old=0 new=%u\n",
-               sock->window.wnd_recv->advertised_wnd);
-    tx_ack(sock);
+    if (sock->window.wnd_recv->advertised_wnd > old_window) {
+        if (old_window == 0)
+            printf("[FLOW][WINDOW_UPDATE] old=0 new=%u\n",
+                   sock->window.wnd_recv->advertised_wnd);
+        tx_ack(sock);
+    }
     RDT_VERBOSE("[RDT][APP_RECV] requested=%d returned=%zu remaining=%d\n",
            len, read_len, sock->received_len);
     pthread_mutex_unlock(&(sock->recv_lock)); // 解锁
@@ -583,6 +755,11 @@ static void *data_rto_worker(void *arg){
         int rlen = pending->len;
         printf("[RDT][RTO_TIMEOUT] seq=%u rto_ms=%u\n", rseq, wnd->rto_ms);
         printf("[RDT][TIMEOUT] seq=%u\n", rseq);
+        uint32_t flight = wnd->snd_nxt - wnd->snd_una;
+        congestion_on_loss(wnd, rseq, wnd->snd_una, flight, 1);
+        wnd->last_ack = wnd->snd_una;
+        wnd->dup_ack_count = 0;
+        wnd->fast_retransmit_done = 0;
         uint32_t old_rto = wnd->rto_ms;
         /* A timeout starts a new recovery epoch; do not carry the bounded
            fast-recovery allowance across an RTO retransmission. */
@@ -778,6 +955,7 @@ static void tx_probe_ack(tju_tcp_t *sock){
 int tju_handle_packet(tju_tcp_t* sock, char* pkt){
 
     uint8_t flags = get_flags(pkt);
+    int peer_window_changed = 0;
     /*
      * 情况1：
      * server LISTEN状态收到SYN
@@ -1006,6 +1184,7 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
     if (sock->state == ESTABLISHED) {
         uint16_t rwnd = get_advertised_window(pkt);
         pthread_mutex_lock(&(sock->recv_lock));
+        peer_window_changed = (rwnd != sock->window.wnd_send->peer_wnd);
         sock->window.wnd_send->peer_wnd = rwnd;
         RDT_VERBOSE("[FLOW][RWND_RX] rwnd=%u\n", rwnd);
         if (rwnd == 0)
@@ -1050,12 +1229,14 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
         } else if (ack > sock->window.wnd_send->snd_una) {
             stats_wnd->advancing_acks++;
             uint32_t confirmed = ack - sock->window.wnd_send->snd_una;
+            uint32_t acked_data = 0;
             struct timeval now;
             gettimeofday(&now, NULL);
             send_segment_t *sample = sock->send_segments;
             int karn_ambiguous = 0;
             while (sample && sample->seq + sample->len <= ack) {
                 if (sample->retransmitted) karn_ambiguous = 1;
+                if (!sample->is_fin) acked_data += sample->len;
                 sample = sample->next;
             }
             if (karn_ambiguous) {
@@ -1098,6 +1279,9 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
                 }
             }
             sock->window.wnd_send->snd_una = ack;
+            congestion_on_ack(sock->window.wnd_send, acked_data,
+                              sock->window.wnd_send->snd_nxt, ack,
+                              sock->window.wnd_send->snd_nxt - ack);
             int fin_just_acked = 0;
             while (sock->send_segments != NULL &&
                    sock->send_segments->seq + sock->send_segments->len <= ack) {
@@ -1184,43 +1368,55 @@ int tju_handle_packet(tju_tcp_t* sock, char* pkt){
         } else if (ack < sock->window.wnd_send->snd_una) {
             stats_wnd->stale_acks++;
         } else if (ack == sock->window.wnd_send->snd_una &&
-                   sock->send_segments != NULL) {
+                   sock->send_segments != NULL &&
+                   !sock->send_segments->is_fin) {
             sender_window_t *wnd = sock->window.wnd_send;
-            wnd->duplicate_acks++;
-            if (wnd->last_ack == ack)
-                wnd->dup_ack_count++;
-            else {
+            /* A window update or an ACK carrying data is not a Reno
+               duplicate ACK, even when its cumulative ACK number is equal. */
+            if (peer_window_changed ||
+                get_plen(pkt) != DEFAULT_HEADER_LEN) {
                 wnd->last_ack = ack;
-                wnd->dup_ack_count = 1;
-            }
-            RDT_VERBOSE("[RDT][DUP_ACK] ack=%u count=%u\n", ack,
-                   wnd->dup_ack_count);
-            if (wnd->dup_ack_count >= 3 && !wnd->fast_retransmit_done) {
-                send_segment_t *seg = sock->send_segments;
-                printf("[RDT][FAST_RETRANSMIT] seq=%u len=%u\n",
-                       seg->seq, seg->len);
-                wnd->fast_retransmits++;
-                char *retry = create_packet_buf(
-                    sock->established_local_addr.port,
-                    sock->established_remote_addr.port,
-                    seg->seq, sock->ack_num,
-                    DEFAULT_HEADER_LEN, DEFAULT_HEADER_LEN + seg->len,
-            ACK_FLAG_MASK, refresh_advertised_window(sock), 0, seg->data, seg->len);
-                sendToLayer3(retry, DEFAULT_HEADER_LEN + seg->len);
-                free(retry);
-                seg->retransmitted = 1;
-                gettimeofday(&seg->send_time, NULL);
-                /* Fast retransmit restarts the single oldest-unacked timer
-                   from the retransmission.  Without this reset, the
-                   original deadline can expire immediately afterwards and
-                   cause a redundant RTO retransmission of the same segment,
-                   needlessly extending loss recovery. */
-                start_rto_timer(wnd);
-                pthread_cond_signal(&(sock->rto_cond));
-                wnd->recovery_active = 1;
-                wnd->recovery_retransmitted = 0;
-                wnd->recovery_end_seq = wnd->snd_nxt;
-                wnd->fast_retransmit_done = 1;
+                wnd->dup_ack_count = 0;
+            } else {
+                wnd->duplicate_acks++;
+                if (wnd->last_ack == ack)
+                    wnd->dup_ack_count++;
+                else {
+                    wnd->last_ack = ack;
+                    wnd->dup_ack_count = 1;
+                }
+                RDT_VERBOSE("[RDT][DUP_ACK] ack=%u count=%u\n", ack,
+                       wnd->dup_ack_count);
+                reno_trace("DUP_ACK", wnd, wnd->snd_nxt, ack,
+                           wnd->snd_nxt - wnd->snd_una);
+                if (wnd->dup_ack_count >= 3 && !wnd->fast_retransmit_done) {
+                    send_segment_t *seg = sock->send_segments;
+                    congestion_on_loss(wnd, seg->seq, ack,
+                                       wnd->snd_nxt - wnd->snd_una, 0);
+                    reno_trace("FAST_RETRANSMIT", wnd, seg->seq, ack,
+                               wnd->snd_nxt - wnd->snd_una);
+                    printf("[RDT][FAST_RETRANSMIT] seq=%u len=%u\n",
+                           seg->seq, seg->len);
+                    wnd->fast_retransmits++;
+                    char *retry = create_packet_buf(
+                        sock->established_local_addr.port,
+                        sock->established_remote_addr.port,
+                        seg->seq, sock->ack_num,
+                        DEFAULT_HEADER_LEN, DEFAULT_HEADER_LEN + seg->len,
+                        ACK_FLAG_MASK, refresh_advertised_window(sock), 0,
+                        seg->data, seg->len);
+                    sendToLayer3(retry, DEFAULT_HEADER_LEN + seg->len);
+                    free(retry);
+                    seg->retransmitted = 1;
+                    gettimeofday(&seg->send_time, NULL);
+                    /* Restart the oldest-unacked timer from retransmission. */
+                    start_rto_timer(wnd);
+                    pthread_cond_signal(&(sock->rto_cond));
+                    wnd->recovery_active = 1;
+                    wnd->recovery_retransmitted = 0;
+                    wnd->recovery_end_seq = wnd->snd_nxt;
+                    wnd->fast_retransmit_done = 1;
+                }
             }
         }
         if ((stats_wnd->total_ack_packets % 10000) == 0) {

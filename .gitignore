@@ -36,6 +36,10 @@ tju_tcp/test/test_congestion
 tju_tcp/test/close_server
 tju_tcp/test/gen_graph_seq
 tju_tcp/test/gen_graph_win
+tju_tcp/test/cc_client
+tju_tcp/test/cc_server
+tju_tcp/test/artifacts/
+tju_tcp/tju_tcp_cc_*.csv
 
 
 # ==========================
